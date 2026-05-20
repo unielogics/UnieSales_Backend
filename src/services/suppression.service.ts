@@ -42,6 +42,15 @@ export async function list(workspaceId: string): Promise<SuppressionListEntry[]>
   return db.select().from(suppressionList).where(eq(suppressionList.workspaceId, workspaceId));
 }
 
+export async function removeById(workspaceId: string, entryId: string): Promise<boolean> {
+  const db = getDb();
+  const rows = await db
+    .delete(suppressionList)
+    .where(and(eq(suppressionList.workspaceId, workspaceId), eq(suppressionList.id, entryId)))
+    .returning({ id: suppressionList.id });
+  return rows.length > 0;
+}
+
 /**
  * Suppress an email AND close every matching lead in the workspace.
  * Returns suppression entry plus number of leads marked closed_unsubscribed.

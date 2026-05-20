@@ -107,4 +107,10 @@ export async function registerLeadSourceRoutes(app: FastifyInstance): Promise<vo
     const { campaignId, sourceId } = parsePath(SourcePathSchema, req.params);
     return ok(await ls.importNow(req.workspace!.id, campaignId, sourceId), 'Import complete');
   });
+
+  app.delete(`${base}/:sourceId`, { preHandler: WRITE }, async (req) => {
+    const { campaignId, sourceId } = parsePath(SourcePathSchema, req.params);
+    const removed = await ls.remove(req.workspace!.id, campaignId, sourceId);
+    return ok({ removed }, removed ? 'Lead source deleted' : 'Not found');
+  });
 }

@@ -448,6 +448,29 @@ function extractPlainTextBody(message: {
   return '';
 }
 
+/**
+ * Disconnect a Gmail account: clears encrypted tokens, marks inactive.
+ * Preserves history (threads + messages stay linked) so analytics and the AI
+ * can still reason about past activity.
+ */
+export async function disconnect(workspaceId: string, gmailAccountId: string): Promise<GmailAccount> {
+  await getAccount(workspaceId, gmailAccountId);
+  const db = getDb();
+  const rows = await db
+    .update(gmailAccounts)
+    .set({
+      isActive: false,
+      healthStatus: 'disconnected',
+      accessTokenEncrypted: null,
+      refreshTokenEncrypted: null,
+      tokenExpiry: null,
+      updatedAt: new Date(),
+    })
+    .where(and(eq(gmailAccounts.workspaceId, workspaceId), eq(gmailAccounts.id, gmailAccountId)))
+    .returning();
+  return rows[0]!;
+}
+
 export async function pauseAccount(workspaceId: string, gmailAccountId: string): Promise<GmailAccount> {
   await getAccount(workspaceId, gmailAccountId);
   const db = getDb();

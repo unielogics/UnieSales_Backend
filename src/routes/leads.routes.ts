@@ -261,4 +261,12 @@ export async function registerLeadRoutes(app: FastifyInstance): Promise<void> {
     reply.code(201);
     return ok(r, 'Email suppressed');
   });
+
+  app.delete('/api/workspaces/:workspaceId/suppression/:entryId', { preHandler: WRITE }, async (req) => {
+    const schema = z.object({ workspaceId: z.string().uuid(), entryId: z.string().uuid() });
+    const r = schema.safeParse(req.params);
+    if (!r.success) throw new ValidationError('Invalid path');
+    const removed = await suppressionService.removeById(req.workspace!.id, r.data.entryId);
+    return ok({ removed }, removed ? 'Removed from suppression list' : 'Not found');
+  });
 }

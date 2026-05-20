@@ -144,6 +144,21 @@ async function insertSource(
   return rows[0]!;
 }
 
+export async function remove(workspaceId: string, campaignId: string, sourceId: string): Promise<boolean> {
+  const db = getDb();
+  const rows = await db
+    .delete(campaignLeadSources)
+    .where(
+      and(
+        eq(campaignLeadSources.workspaceId, workspaceId),
+        eq(campaignLeadSources.campaignId, campaignId),
+        eq(campaignLeadSources.id, sourceId),
+      ),
+    )
+    .returning({ id: campaignLeadSources.id });
+  return rows.length > 0;
+}
+
 export async function mapColumns(
   workspaceId: string,
   campaignId: string,

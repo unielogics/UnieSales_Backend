@@ -138,6 +138,26 @@ export async function registerGmailRoutes(app: FastifyInstance): Promise<void> {
     },
   );
 
+  app.delete(
+    '/api/workspaces/:workspaceId/gmail/accounts/:gmailAccountId',
+    { preHandler: WRITE },
+    async (req) => {
+      const { gmailAccountId } = parsePath(AccountPath, req.params);
+      const account = await gmailService.disconnect(req.workspace!.id, gmailAccountId);
+      return ok(
+        {
+          account: {
+            id: account.id,
+            email: account.email,
+            isActive: account.isActive,
+            healthStatus: account.healthStatus,
+          },
+        },
+        'Gmail account disconnected — tokens cleared, history preserved',
+      );
+    },
+  );
+
   app.patch(
     '/api/workspaces/:workspaceId/gmail/accounts/:gmailAccountId/send-limits',
     { preHandler: WRITE },

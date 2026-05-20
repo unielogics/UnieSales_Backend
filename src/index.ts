@@ -5,7 +5,10 @@ import { pinoOptions } from './config/logger';
 import { closeDb, initDb, pingDb } from './config/db';
 import { registerErrorHandler } from './middleware/error-handler';
 import { registerHealthRoutes } from './routes/health.routes';
+import { registerAuthRoutes } from './routes/auth.routes';
 import { isEnvelope, ok } from './services/response.service';
+// Side-effect import: augments FastifyRequest with user + workspace
+import './types/api';
 
 async function main(): Promise<void> {
   const e = await loadEnv();
@@ -44,6 +47,7 @@ async function main(): Promise<void> {
   });
 
   await registerHealthRoutes(app);
+  await registerAuthRoutes(app);
 
   app.get('/', async () => ok({ name: 'uniesales-api', version: '0.1.0' }));
 

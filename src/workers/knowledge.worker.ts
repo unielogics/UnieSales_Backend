@@ -11,6 +11,7 @@ import { createLogger } from '../config/logger';
 import { claimNextPending, markExtracted, markExtractionFailed } from '../services/knowledge.service';
 import { getObjectBuffer } from '../services/s3.service';
 import { extractText } from '../services/extraction.service';
+import { summarizeKnowledge } from '../services/ai-tasks.service';
 
 const POLL_INTERVAL_MS = 5_000;
 const MAX_CONSECUTIVE_ERRORS = 10;
@@ -32,8 +33,26 @@ async function processOne(): Promise<boolean> {
     const key = file.s3Url.replace(/^s3:\/\/[^/]+\//, '');
     const buf = await getObjectBuffer(key);
     const { text } = await extractText(buf, file.fileName, file.fileType ?? undefined);
-    await markExtracted(file.id, { extractedText: text });
-    log.info({ fileId: file.id, chars: text.length }, 'extraction: done');
+
+    // Try AI summarization. If Anthropic isn't configured yet, persist the
+    // extracted text and skip the summary — the API endpoint can re-trigger it.
+    let summary: string | null = null;
+    let documentType: Awaited<ReturnType<typeof summarizeKnowledge>>['output']['document_type'] | null = null;
+    try {
+      const ai = await summarizeKnowledge({
+        workspaceId: file.workspaceId,
+        campaignId: file.campaignId,
+        fileName: file.fileName,
+        extractedText: text,
+      });
+      summary = ai.output.summary;
+      documentType = ai.output.document_type;
+    } catch (err) {
+      log.warn({ fileId: file.id, err: (err as Error).message }, 'extraction: summary skipped');
+    }
+
+    await markExtracted(file.id, { extractedText: text, summary, documentType });
+    log.info({ fileId: file.id, chars: text.length, summarized: summary != null }, 'extraction: done');
     return true;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

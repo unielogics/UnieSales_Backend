@@ -1,4 +1,11 @@
-// PM2 process map. Workers come online in Phase 11; commented out for Phase 0.
+// PM2 process map: api + 5 workers.
+const workerLog = (name) => ({
+  out_file: `/opt/uniesales/logs/${name}.out.log`,
+  error_file: `/opt/uniesales/logs/${name}.err.log`,
+  merge_logs: true,
+  time: true,
+});
+
 module.exports = {
   apps: [
     {
@@ -7,47 +14,43 @@ module.exports = {
       instances: 1,
       exec_mode: 'fork',
       max_memory_restart: '1G',
-      env: {
-        NODE_ENV: 'production',
-      },
-      out_file: '/opt/uniesales/logs/api.out.log',
-      error_file: '/opt/uniesales/logs/api.err.log',
-      merge_logs: true,
-      time: true,
+      env: { NODE_ENV: 'production' },
+      ...workerLog('api'),
     },
-    // {
-    //   name: 'gmail-worker',
-    //   script: './dist/workers/gmail.worker.js',
-    //   instances: 1,
-    //   env: { NODE_ENV: 'production' },
-    // },
-    // {
-    //   name: 'ai-worker',
-    //   script: './dist/workers/ai.worker.js',
-    //   instances: 1,
-    //   env: { NODE_ENV: 'production' },
-    // },
-    // {
-    //   name: 'followup-worker',
-    //   script: './dist/workers/followup.worker.js',
-    //   instances: 1,
-    //   env: { NODE_ENV: 'production' },
-    // },
     {
       name: 'knowledge-worker',
       script: './dist/workers/knowledge.worker.js',
       instances: 1,
       env: { NODE_ENV: 'production' },
-      out_file: '/opt/uniesales/logs/knowledge-worker.out.log',
-      error_file: '/opt/uniesales/logs/knowledge-worker.err.log',
-      merge_logs: true,
-      time: true,
+      ...workerLog('knowledge-worker'),
     },
-    // {
-    //   name: 'domain-health-worker',
-    //   script: './dist/workers/domain-health.worker.js',
-    //   instances: 1,
-    //   env: { NODE_ENV: 'production' },
-    // },
+    {
+      name: 'gmail-worker',
+      script: './dist/workers/gmail.worker.js',
+      instances: 1,
+      env: { NODE_ENV: 'production' },
+      ...workerLog('gmail-worker'),
+    },
+    {
+      name: 'ai-worker',
+      script: './dist/workers/ai.worker.js',
+      instances: 1,
+      env: { NODE_ENV: 'production' },
+      ...workerLog('ai-worker'),
+    },
+    {
+      name: 'followup-worker',
+      script: './dist/workers/followup.worker.js',
+      instances: 1,
+      env: { NODE_ENV: 'production' },
+      ...workerLog('followup-worker'),
+    },
+    {
+      name: 'domain-health-worker',
+      script: './dist/workers/domain-health.worker.js',
+      instances: 1,
+      env: { NODE_ENV: 'production' },
+      ...workerLog('domain-health-worker'),
+    },
   ],
 };

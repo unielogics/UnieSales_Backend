@@ -243,6 +243,153 @@ export async function summarizeThread(input: {
   });
 }
 
+// ---------- generate_playbook (heavy) ----------
+
+const GeneratePlaybookOutputSchema = z.object({
+  campaign_thesis: z.string(),
+  buyer_persona: z.string(),
+  target_pains: z.string(),
+  value_proposition: z.string(),
+  primary_hook: z.string(),
+  primary_cta: z.string(),
+  objection_map: z.array(
+    z.object({ objection: z.string(), response: z.string(), handoff: z.boolean() }),
+  ),
+  allowed_claims: z.string(),
+  prohibited_claims: z.string(),
+  handoff_rules: z.string(),
+  exit_rules: z.string(),
+  ai_operating_instructions: z.string(),
+  confidence: z.number().min(0).max(1),
+});
+export type GeneratePlaybookOutput = z.infer<typeof GeneratePlaybookOutputSchema>;
+
+export async function generatePlaybook(input: {
+  workspaceId: string;
+  campaignId: string;
+  trainingTranscript?: string;
+}): Promise<AiActionResult<GeneratePlaybookOutput>> {
+  return runAction({
+    workspaceId: input.workspaceId,
+    campaignId: input.campaignId,
+    actionType: 'generate_playbook',
+    outputSchema: GeneratePlaybookOutputSchema,
+    forceHeavy: true,
+    taskPrompt: `Synthesize a campaign playbook the AI Sales Operator will follow during outbound + nurture.
+
+Use the campaign context (goal, target audience, knowledge files) AND the training transcript below if provided. Never invent pricing, guarantees, legal terms, revenue shares, or unsupported claims — pull everything from what the user actually said in training and what's in the knowledge files.
+
+${input.trainingTranscript ? `\n## Training transcript\n\n${input.trainingTranscript}\n` : ''}`,
+    jsonSchema: {
+      type: 'object',
+      properties: {
+        campaign_thesis: { type: 'string' },
+        buyer_persona: { type: 'string' },
+        target_pains: { type: 'string' },
+        value_proposition: { type: 'string' },
+        primary_hook: { type: 'string' },
+        primary_cta: { type: 'string' },
+        objection_map: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              objection: { type: 'string' },
+              response: { type: 'string' },
+              handoff: { type: 'boolean' },
+            },
+            required: ['objection', 'response', 'handoff'],
+            additionalProperties: false,
+          },
+        },
+        allowed_claims: { type: 'string' },
+        prohibited_claims: { type: 'string' },
+        handoff_rules: { type: 'string' },
+        exit_rules: { type: 'string' },
+        ai_operating_instructions: { type: 'string' },
+        confidence: { type: 'number', minimum: 0, maximum: 1 },
+      },
+      required: [
+        'campaign_thesis',
+        'buyer_persona',
+        'target_pains',
+        'value_proposition',
+        'primary_hook',
+        'primary_cta',
+        'objection_map',
+        'allowed_claims',
+        'prohibited_claims',
+        'handoff_rules',
+        'exit_rules',
+        'ai_operating_instructions',
+        'confidence',
+      ],
+      additionalProperties: false,
+    },
+  });
+}
+
+// ---------- generate_demo_guide (heavy) ----------
+
+const GenerateDemoGuideOutputSchema = z.object({
+  demo_goal: z.string(),
+  pre_call_confirmation_template: z.string(),
+  call_agenda: z.string(),
+  discovery_questions: z.array(z.string()),
+  demo_flow: z.array(z.string()),
+  qualification_questions: z.array(z.string()),
+  post_call_followup_template: z.string(),
+  proposal_request_checklist: z.array(z.string()),
+  handoff_summary_template: z.string(),
+  confidence: z.number().min(0).max(1),
+});
+export type GenerateDemoGuideOutput = z.infer<typeof GenerateDemoGuideOutputSchema>;
+
+export async function generateDemoGuide(input: {
+  workspaceId: string;
+  campaignId: string;
+  trainingTranscript?: string;
+}): Promise<AiActionResult<GenerateDemoGuideOutput>> {
+  return runAction({
+    workspaceId: input.workspaceId,
+    campaignId: input.campaignId,
+    actionType: 'generate_demo_guide',
+    outputSchema: GenerateDemoGuideOutputSchema,
+    forceHeavy: true,
+    taskPrompt: `Produce a demo / discovery call playbook for this campaign. Pull from the campaign goal, playbook (if it exists), and the training transcript if provided. Keep templates editable and concise.
+
+${input.trainingTranscript ? `\n## Training transcript\n\n${input.trainingTranscript}\n` : ''}`,
+    jsonSchema: {
+      type: 'object',
+      properties: {
+        demo_goal: { type: 'string' },
+        pre_call_confirmation_template: { type: 'string' },
+        call_agenda: { type: 'string' },
+        discovery_questions: { type: 'array', items: { type: 'string' } },
+        demo_flow: { type: 'array', items: { type: 'string' } },
+        qualification_questions: { type: 'array', items: { type: 'string' } },
+        post_call_followup_template: { type: 'string' },
+        proposal_request_checklist: { type: 'array', items: { type: 'string' } },
+        handoff_summary_template: { type: 'string' },
+        confidence: { type: 'number', minimum: 0, maximum: 1 },
+      },
+      required: [
+        'demo_goal',
+        'pre_call_confirmation_template',
+        'call_agenda',
+        'discovery_questions',
+        'demo_flow',
+        'qualification_questions',
+        'post_call_followup_template',
+        'proposal_request_checklist',
+        'handoff_summary_template',
+        'confidence',
+      ],
+      additionalProperties: false,
+    },
+  });
+}
+
 // ---------- summarize_knowledge ----------
 
 const SummarizeKnowledgeOutputSchema = z.object({

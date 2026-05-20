@@ -5,6 +5,7 @@ import { requireWorkspaceMembership, requireWorkspaceRole } from '../middleware/
 import { ok } from '../services/response.service';
 import { ValidationError } from '../utils/errors';
 import * as setup from '../services/campaign-setup.service';
+import * as aiTasks from '../services/ai-tasks.service';
 
 const PathSchema = z.object({ workspaceId: z.string().uuid(), campaignId: z.string().uuid() });
 
@@ -125,8 +126,28 @@ export async function registerCampaignSetupRoutes(app: FastifyInstance): Promise
     const input = parseBody(PlaybookSchema, req.body);
     return ok({ playbook: await setup.upsertPlaybook(req.workspace!.id, campaignId, input) }, 'Updated');
   });
-  app.post(`${base}/playbook/generate`, { preHandler: WRITE }, async () => {
-    return ok({ generated: false }, 'AI playbook generation wired up in Phase 10');
+  app.post(`${base}/playbook/generate`, { preHandler: WRITE }, async (req) => {
+    const { campaignId } = parseParams(req.params);
+    const result = await aiTasks.generatePlaybook({
+      workspaceId: req.workspace!.id,
+      campaignId,
+    });
+    // Persist the generated content as the campaign's playbook (status=draft)
+    const persisted = await setup.upsertPlaybook(req.workspace!.id, campaignId, {
+      campaignThesis: result.output.campaign_thesis,
+      buyerPersona: result.output.buyer_persona,
+      targetPains: result.output.target_pains,
+      valueProposition: result.output.value_proposition,
+      primaryHook: result.output.primary_hook,
+      primaryCta: result.output.primary_cta,
+      objectionMap: result.output.objection_map,
+      allowedClaims: result.output.allowed_claims,
+      prohibitedClaims: result.output.prohibited_claims,
+      handoffRules: result.output.handoff_rules,
+      exitRules: result.output.exit_rules,
+      aiOperatingInstructions: result.output.ai_operating_instructions,
+    });
+    return ok({ playbook: persisted, ai: { actionId: result.action.id, confidence: result.confidence } }, 'Playbook generated');
   });
   app.post(`${base}/playbook/approve`, { preHandler: WRITE }, async (req) => {
     const { campaignId } = parseParams(req.params);
@@ -143,8 +164,24 @@ export async function registerCampaignSetupRoutes(app: FastifyInstance): Promise
     const input = parseBody(DemoGuideSchema, req.body);
     return ok({ demoGuide: await setup.upsertDemoGuide(req.workspace!.id, campaignId, input) }, 'Updated');
   });
-  app.post(`${base}/demo-guide/generate`, { preHandler: WRITE }, async () => {
-    return ok({ generated: false }, 'AI demo-guide generation wired up in Phase 10');
+  app.post(`${base}/demo-guide/generate`, { preHandler: WRITE }, async (req) => {
+    const { campaignId } = parseParams(req.params);
+    const result = await aiTasks.generateDemoGuide({
+      workspaceId: req.workspace!.id,
+      campaignId,
+    });
+    const persisted = await setup.upsertDemoGuide(req.workspace!.id, campaignId, {
+      demoGoal: result.output.demo_goal,
+      preCallConfirmationTemplate: result.output.pre_call_confirmation_template,
+      callAgenda: result.output.call_agenda,
+      discoveryQuestions: result.output.discovery_questions,
+      demoFlow: result.output.demo_flow,
+      qualificationQuestions: result.output.qualification_questions,
+      postCallFollowupTemplate: result.output.post_call_followup_template,
+      proposalRequestChecklist: result.output.proposal_request_checklist,
+      handoffSummaryTemplate: result.output.handoff_summary_template,
+    });
+    return ok({ demoGuide: persisted, ai: { actionId: result.action.id, confidence: result.confidence } }, 'Demo guide generated');
   });
   app.post(`${base}/demo-guide/approve`, { preHandler: WRITE }, async (req) => {
     const { campaignId } = parseParams(req.params);

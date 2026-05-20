@@ -14,6 +14,7 @@ import { registerLeadSourceRoutes } from './routes/lead-sources.routes';
 import { registerLeadRoutes } from './routes/leads.routes';
 import { registerGmailRoutes } from './routes/gmail.routes';
 import { registerAiActionRoutes } from './routes/ai-actions.routes';
+import { registerCampaignTrainingRoutes } from './routes/campaign-training.routes';
 import { isEnvelope, ok } from './services/response.service';
 // Side-effect import: augments FastifyRequest with user + workspace
 import './types/api';
@@ -64,6 +65,7 @@ async function main(): Promise<void> {
   await registerLeadRoutes(app);
   await registerGmailRoutes(app);
   await registerAiActionRoutes(app);
+  await registerCampaignTrainingRoutes(app);
 
   app.get('/', async () => ok({ name: 'uniesales-api', version: '0.1.0' }));
 

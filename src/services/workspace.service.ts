@@ -69,6 +69,9 @@ export interface DashboardSummary {
     leads: { total: number; active: number; closed: number };
     gmail_accounts: number;
     pending_ai_actions: number;
+    send_volume_7d: number;
+    handoff_queue: number;
+    replied_7d: number;
   };
 }
 
@@ -107,6 +110,22 @@ export async function dashboard(workspaceId: string): Promise<DashboardSummary> 
     .from(aiActions)
     .where(and(eq(aiActions.workspaceId, workspaceId), inArray(aiActions.status, ['pending', 'processing'])));
 
+  // Send volume in last 7 days + handoff queue depth + recent thread activity
+  const [sendVolume] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(sql`email_messages`)
+    .where(
+      sql`workspace_id = ${workspaceId} AND direction = 'outbound' AND created_at >= NOW() - INTERVAL '7 days'`,
+    );
+  const [handoffQueue] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(leads)
+    .where(and(eq(leads.workspaceId, workspaceId), eq(leads.status, 'handoff_required')));
+  const [repliedThisWeek] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(leads)
+    .where(sql`workspace_id = ${workspaceId} AND status = 'replied' AND updated_at >= NOW() - INTERVAL '7 days'`);
+
   return {
     workspace: ws,
     counts: {
@@ -122,6 +141,9 @@ export async function dashboard(workspaceId: string): Promise<DashboardSummary> 
       },
       gmail_accounts: gmailCount?.n ?? 0,
       pending_ai_actions: aiPending?.n ?? 0,
+      send_volume_7d: sendVolume?.n ?? 0,
+      handoff_queue: handoffQueue?.n ?? 0,
+      replied_7d: repliedThisWeek?.n ?? 0,
     },
   };
 }

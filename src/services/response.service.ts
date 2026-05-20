@@ -1,4 +1,4 @@
-import type { ErrorDetail } from '../utils/errors.js';
+import type { ErrorDetail } from '../utils/errors';
 
 export interface ApiSuccess<T> {
   success: true;

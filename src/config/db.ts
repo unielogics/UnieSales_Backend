@@ -1,6 +1,6 @@
 import { drizzle, type NodePgDatabase } from 'drizzle-orm/node-postgres';
 import pg from 'pg';
-import { env } from './env.js';
+import { env } from './env';
 
 let pool: pg.Pool | null = null;
 let db: NodePgDatabase | null = null;

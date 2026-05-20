@@ -2,7 +2,6 @@
   "name": "uniesales-backend",
   "version": "0.1.0",
   "description": "UnieSales / AI Sales Operator OS — production backend",
-  "type": "module",
   "private": true,
   "engines": {
     "node": ">=20"

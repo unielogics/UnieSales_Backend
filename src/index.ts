@@ -1,11 +1,11 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
-import { loadEnv } from './config/env.js';
-import { pinoOptions } from './config/logger.js';
-import { closeDb, initDb, pingDb } from './config/db.js';
-import { registerErrorHandler } from './middleware/error-handler.js';
-import { registerHealthRoutes } from './routes/health.routes.js';
-import { isEnvelope, ok } from './services/response.service.js';
+import { loadEnv } from './config/env';
+import { pinoOptions } from './config/logger';
+import { closeDb, initDb, pingDb } from './config/db';
+import { registerErrorHandler } from './middleware/error-handler';
+import { registerHealthRoutes } from './routes/health.routes';
+import { isEnvelope, ok } from './services/response.service';
 
 async function main(): Promise<void> {
   const e = await loadEnv();

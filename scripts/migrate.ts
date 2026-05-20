@@ -3,8 +3,8 @@
  * Phase 0: no migrations yet; this script will be a no-op until schema files exist.
  * Phase 1: migrations folder will be populated by `drizzle-kit generate`.
  */
-import { loadEnv } from '../src/config/env.js';
-import { initDb, getPool, closeDb } from '../src/config/db.js';
+import { loadEnv } from '../src/config/env';
+import { initDb, getPool, closeDb } from '../src/config/db';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import fs from 'node:fs';

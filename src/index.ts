@@ -10,6 +10,7 @@ import { registerWorkspaceRoutes } from './routes/workspaces.routes';
 import { registerCampaignRoutes } from './routes/campaigns.routes';
 import { registerCampaignSetupRoutes } from './routes/campaign-setup.routes';
 import { registerKnowledgeRoutes } from './routes/knowledge.routes';
+import { registerLeadSourceRoutes } from './routes/lead-sources.routes';
 import { isEnvelope, ok } from './services/response.service';
 // Side-effect import: augments FastifyRequest with user + workspace
 import './types/api';
@@ -56,6 +57,7 @@ async function main(): Promise<void> {
   await registerCampaignRoutes(app);
   await registerCampaignSetupRoutes(app);
   await registerKnowledgeRoutes(app);
+  await registerLeadSourceRoutes(app);
 
   app.get('/', async () => ok({ name: 'uniesales-api', version: '0.1.0' }));
 

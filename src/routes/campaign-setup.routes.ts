@@ -1,0 +1,153 @@
+import type { FastifyInstance } from 'fastify';
+import { z } from 'zod';
+import { requireAuth } from '../middleware/auth';
+import { requireWorkspaceMembership, requireWorkspaceRole } from '../middleware/workspace';
+import { ok } from '../services/response.service';
+import { ValidationError } from '../utils/errors';
+import * as setup from '../services/campaign-setup.service';
+
+const PathSchema = z.object({ workspaceId: z.string().uuid(), campaignId: z.string().uuid() });
+
+const GoalSchema = z.object({
+  primaryGoal: z.string().min(1),
+  secondaryGoal: z.string().optional(),
+  primaryCta: z.string().min(1),
+  successDefinition: z.string().optional(),
+  qualifiedReplyDefinition: z.string().optional(),
+  targetAudience: z.string().optional(),
+  offerSummary: z.string().optional(),
+  allowedClaims: z.string().optional(),
+  prohibitedClaims: z.string().optional(),
+  handoffTriggers: z.string().optional(),
+  autoReplyBoundaries: z.string().optional(),
+});
+
+const ExitRulesSchema = z.object({
+  maxEmailAttempts: z.number().int().min(0).max(50).optional(),
+  maxDaysInSequence: z.number().int().min(0).max(365).optional(),
+  maxNoReplyFollowups: z.number().int().min(0).max(50).optional(),
+  stopOnUnsubscribe: z.boolean().optional(),
+  stopOnHardBounce: z.boolean().optional(),
+  stopOnNotInterested: z.boolean().optional(),
+  stopOnWrongPersonWithoutReferral: z.boolean().optional(),
+  stopOnBadFit: z.boolean().optional(),
+  pauseOnOutOfOffice: z.boolean().optional(),
+  outOfOfficeResumeDays: z.number().int().min(0).max(365).optional(),
+  stopIfNoReplyAfterBreakup: z.boolean().optional(),
+  reactivationAllowed: z.boolean().optional(),
+  reactivationAfterDays: z.number().int().min(0).max(3650).optional(),
+});
+
+const PlaybookSchema = z.object({
+  campaignThesis: z.string().optional(),
+  buyerPersona: z.string().optional(),
+  targetPains: z.string().optional(),
+  valueProposition: z.string().optional(),
+  primaryHook: z.string().optional(),
+  primaryCta: z.string().optional(),
+  objectionMap: z.unknown().optional(),
+  allowedClaims: z.string().optional(),
+  prohibitedClaims: z.string().optional(),
+  handoffRules: z.string().optional(),
+  exitRules: z.string().optional(),
+  aiOperatingInstructions: z.string().optional(),
+});
+
+const DemoGuideSchema = z.object({
+  demoGoal: z.string().optional(),
+  preCallConfirmationTemplate: z.string().optional(),
+  callAgenda: z.string().optional(),
+  discoveryQuestions: z.unknown().optional(),
+  demoFlow: z.unknown().optional(),
+  qualificationQuestions: z.unknown().optional(),
+  postCallFollowupTemplate: z.string().optional(),
+  proposalRequestChecklist: z.unknown().optional(),
+  handoffSummaryTemplate: z.string().optional(),
+});
+
+function parseBody<T extends z.ZodTypeAny>(s: T, body: unknown): z.infer<T> {
+  const r = s.safeParse(body);
+  if (!r.success) {
+    throw new ValidationError(
+      'Validation failed',
+      r.error.issues.map((i) => ({ field: i.path.join('.'), reason: i.message })),
+    );
+  }
+  return r.data;
+}
+
+function parseParams(params: unknown): { workspaceId: string; campaignId: string } {
+  const r = PathSchema.safeParse(params);
+  if (!r.success) {
+    throw new ValidationError(
+      'Invalid path',
+      r.error.issues.map((i) => ({ field: i.path.join('.'), reason: i.message })),
+    );
+  }
+  return r.data;
+}
+
+const READ = [requireAuth, requireWorkspaceMembership];
+const WRITE = [requireAuth, requireWorkspaceMembership, requireWorkspaceRole('admin')];
+
+export async function registerCampaignSetupRoutes(app: FastifyInstance): Promise<void> {
+  const base = '/api/workspaces/:workspaceId/campaigns/:campaignId';
+
+  // ---- goal ----
+  app.get(`${base}/goal`, { preHandler: READ }, async (req) => {
+    const { campaignId } = parseParams(req.params);
+    return ok({ goal: await setup.getGoal(req.workspace!.id, campaignId) });
+  });
+  app.patch(`${base}/goal`, { preHandler: WRITE }, async (req) => {
+    const { campaignId } = parseParams(req.params);
+    const input = parseBody(GoalSchema.partial(), req.body);
+    return ok({ goal: await setup.upsertGoal(req.workspace!.id, campaignId, input) }, 'Updated');
+  });
+
+  // ---- exit rules ----
+  app.get(`${base}/exit-rules`, { preHandler: READ }, async (req) => {
+    const { campaignId } = parseParams(req.params);
+    return ok({ exitRules: await setup.getExitRules(req.workspace!.id, campaignId) });
+  });
+  app.patch(`${base}/exit-rules`, { preHandler: WRITE }, async (req) => {
+    const { campaignId } = parseParams(req.params);
+    const input = parseBody(ExitRulesSchema, req.body);
+    return ok({ exitRules: await setup.upsertExitRules(req.workspace!.id, campaignId, input) }, 'Updated');
+  });
+
+  // ---- playbook ----
+  app.get(`${base}/playbook`, { preHandler: READ }, async (req) => {
+    const { campaignId } = parseParams(req.params);
+    return ok({ playbook: await setup.getPlaybook(req.workspace!.id, campaignId) });
+  });
+  app.patch(`${base}/playbook`, { preHandler: WRITE }, async (req) => {
+    const { campaignId } = parseParams(req.params);
+    const input = parseBody(PlaybookSchema, req.body);
+    return ok({ playbook: await setup.upsertPlaybook(req.workspace!.id, campaignId, input) }, 'Updated');
+  });
+  app.post(`${base}/playbook/generate`, { preHandler: WRITE }, async () => {
+    return ok({ generated: false }, 'AI playbook generation wired up in Phase 10');
+  });
+  app.post(`${base}/playbook/approve`, { preHandler: WRITE }, async (req) => {
+    const { campaignId } = parseParams(req.params);
+    return ok({ playbook: await setup.approvePlaybook(req.workspace!.id, campaignId) }, 'Playbook approved');
+  });
+
+  // ---- demo guide ----
+  app.get(`${base}/demo-guide`, { preHandler: READ }, async (req) => {
+    const { campaignId } = parseParams(req.params);
+    return ok({ demoGuide: await setup.getDemoGuide(req.workspace!.id, campaignId) });
+  });
+  app.patch(`${base}/demo-guide`, { preHandler: WRITE }, async (req) => {
+    const { campaignId } = parseParams(req.params);
+    const input = parseBody(DemoGuideSchema, req.body);
+    return ok({ demoGuide: await setup.upsertDemoGuide(req.workspace!.id, campaignId, input) }, 'Updated');
+  });
+  app.post(`${base}/demo-guide/generate`, { preHandler: WRITE }, async () => {
+    return ok({ generated: false }, 'AI demo-guide generation wired up in Phase 10');
+  });
+  app.post(`${base}/demo-guide/approve`, { preHandler: WRITE }, async (req) => {
+    const { campaignId } = parseParams(req.params);
+    return ok({ demoGuide: await setup.approveDemoGuide(req.workspace!.id, campaignId) }, 'Demo guide approved');
+  });
+}

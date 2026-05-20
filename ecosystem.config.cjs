@@ -33,12 +33,16 @@ module.exports = {
     //   instances: 1,
     //   env: { NODE_ENV: 'production' },
     // },
-    // {
-    //   name: 'knowledge-worker',
-    //   script: './dist/workers/knowledge.worker.js',
-    //   instances: 1,
-    //   env: { NODE_ENV: 'production' },
-    // },
+    {
+      name: 'knowledge-worker',
+      script: './dist/workers/knowledge.worker.js',
+      instances: 1,
+      env: { NODE_ENV: 'production' },
+      out_file: '/opt/uniesales/logs/knowledge-worker.out.log',
+      error_file: '/opt/uniesales/logs/knowledge-worker.err.log',
+      merge_logs: true,
+      time: true,
+    },
     // {
     //   name: 'domain-health-worker',
     //   script: './dist/workers/domain-health.worker.js',

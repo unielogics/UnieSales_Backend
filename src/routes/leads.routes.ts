@@ -6,6 +6,8 @@ import { ok } from '../services/response.service';
 import { ValidationError } from '../utils/errors';
 import * as leadService from '../services/lead.service';
 import * as suppressionService from '../services/suppression.service';
+import * as aiTasks from '../services/ai-tasks.service';
+import { ConflictError } from '../utils/errors';
 import { LEAD_STATUSES, type LeadStatus } from '../db/schema/leads';
 
 const WorkspacePath = z.object({ workspaceId: z.string().uuid() });
@@ -196,15 +198,52 @@ export async function registerLeadRoutes(app: FastifyInstance): Promise<void> {
     return ok(r, 'Lead and email suppressed');
   });
 
-  // ---- AI / Gmail stubs — wired up in Phase 9 + Phase 8 ----
-  app.post(`${base}/:leadId/score`, { preHandler: WRITE }, async () => {
-    return ok({ scored: false }, 'AI scoring wired up in Phase 9');
+  // ---- AI scoring / email generation ----
+  app.post(`${base}/:leadId/score`, { preHandler: WRITE }, async (req) => {
+    const { leadId } = parsePath(LeadPath, req.params);
+    const lead = await leadService.getById(req.workspace!.id, leadId);
+    if (!lead.campaignId) {
+      throw new ConflictError('Lead has no campaign assigned', [
+        { field: 'campaignId', reason: 'required for scoring' },
+      ]);
+    }
+    const result = await aiTasks.scoreLead({
+      workspaceId: req.workspace!.id,
+      campaignId: lead.campaignId,
+      leadId,
+    });
+    const updated = await leadService.update(req.workspace!.id, leadId, {
+      leadScore: result.output.score,
+      leadScoreReason: result.output.reasoning,
+      status: 'scored',
+    });
+    return ok({ lead: updated, ai: { actionId: result.action.id, ...result.output } }, 'Scored');
   });
-  app.post(`${base}/:leadId/generate-email`, { preHandler: WRITE }, async () => {
-    return ok({ generated: false }, 'AI email generation wired up in Phase 9');
+
+  const GenerateEmailSchema = z.object({
+    stage: z.enum(['cold', 'followup_1', 'followup_2', 'followup_3', 'breakup']).optional(),
   });
+  app.post(`${base}/:leadId/generate-email`, { preHandler: WRITE }, async (req) => {
+    const { leadId } = parsePath(LeadPath, req.params);
+    const input = parseBody(GenerateEmailSchema, req.body ?? {});
+    const lead = await leadService.getById(req.workspace!.id, leadId);
+    if (!lead.campaignId) {
+      throw new ConflictError('Lead has no campaign assigned', [
+        { field: 'campaignId', reason: 'required for email generation' },
+      ]);
+    }
+    const result = await aiTasks.generateEmail({
+      workspaceId: req.workspace!.id,
+      campaignId: lead.campaignId,
+      leadId,
+      stage: input.stage,
+    });
+    return ok({ ai: { actionId: result.action.id, ...result.output } }, 'Email drafted');
+  });
+
+  // Send-next is wired up in Phase 11 (workers); the route stays so the UI knows it exists.
   app.post(`${base}/:leadId/send-next`, { preHandler: WRITE }, async () => {
-    return ok({ sent: false }, 'Outbound send wired up in Phase 8');
+    return ok({ sent: false }, 'Use /api/workspaces/:wid/gmail/send for now; sequencer lands in Phase 11');
   });
 
   // ---- Workspace-level suppression list ----

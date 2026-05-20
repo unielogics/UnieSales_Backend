@@ -1,0 +1,310 @@
+/**
+ * Concrete AI task wrappers. Each function builds a task-specific prompt
+ * and JSON schema, runs it through ai.service.runAction, and returns the
+ * validated output plus the persisted ai_actions row.
+ */
+import { z } from 'zod';
+import { runAction, type AiActionResult } from './ai.service';
+
+// ---------- score_lead ----------
+
+const ScoreLeadOutputSchema = z.object({
+  score: z.number().int().min(0).max(100),
+  reasoning: z.string().min(1),
+  fit: z.enum(['high', 'medium', 'low']),
+  confidence: z.number().min(0).max(1),
+});
+export type ScoreLeadOutput = z.infer<typeof ScoreLeadOutputSchema>;
+
+export async function scoreLead(input: {
+  workspaceId: string;
+  campaignId: string;
+  leadId: string;
+}): Promise<AiActionResult<ScoreLeadOutput>> {
+  return runAction({
+    workspaceId: input.workspaceId,
+    campaignId: input.campaignId,
+    leadId: input.leadId,
+    actionType: 'score_lead',
+    outputSchema: ScoreLeadOutputSchema,
+    taskPrompt:
+      'Score this lead 0–100 based on fit with the campaign target_audience, primary_goal, and playbook buyer_persona. Use the lead\'s company, title, segment, and website to assess fit. Provide reasoning and a fit bucket.',
+    jsonSchema: {
+      type: 'object',
+      properties: {
+        score: { type: 'integer', minimum: 0, maximum: 100 },
+        reasoning: { type: 'string' },
+        fit: { type: 'string', enum: ['high', 'medium', 'low'] },
+        confidence: { type: 'number', minimum: 0, maximum: 1 },
+      },
+      required: ['score', 'reasoning', 'fit', 'confidence'],
+      additionalProperties: false,
+    },
+  });
+}
+
+// ---------- generate_email ----------
+
+const GenerateEmailOutputSchema = z.object({
+  subject: z.string().min(1).max(150),
+  body: z.string().min(1).max(4000),
+  personalization_used: z.array(z.string()),
+  confidence: z.number().min(0).max(1),
+  reasoning: z.string(),
+});
+export type GenerateEmailOutput = z.infer<typeof GenerateEmailOutputSchema>;
+
+export async function generateEmail(input: {
+  workspaceId: string;
+  campaignId: string;
+  leadId: string;
+  stage?: 'cold' | 'followup_1' | 'followup_2' | 'followup_3' | 'breakup';
+}): Promise<AiActionResult<GenerateEmailOutput>> {
+  const stage = input.stage ?? 'cold';
+  return runAction({
+    workspaceId: input.workspaceId,
+    campaignId: input.campaignId,
+    leadId: input.leadId,
+    actionType: 'generate_email',
+    outputSchema: GenerateEmailOutputSchema,
+    taskPrompt: `Draft a ${stage} outbound email for this lead. Use playbook.primary_hook and primary_cta. Reference one specific detail about the lead (company/title/website). Keep it under 120 words. No invented claims, pricing, or guarantees.`,
+    jsonSchema: {
+      type: 'object',
+      properties: {
+        subject: { type: 'string' },
+        body: { type: 'string' },
+        personalization_used: { type: 'array', items: { type: 'string' } },
+        confidence: { type: 'number', minimum: 0, maximum: 1 },
+        reasoning: { type: 'string' },
+      },
+      required: ['subject', 'body', 'personalization_used', 'confidence', 'reasoning'],
+      additionalProperties: false,
+    },
+  });
+}
+
+// ---------- classify_reply ----------
+
+const REPLY_CLASSIFICATIONS = [
+  'positive_interest',
+  'meeting_request',
+  'send_more_info',
+  'pricing_question',
+  'objection_existing_system',
+  'objection_not_now',
+  'objection_cost',
+  'objection_skeptical',
+  'referral',
+  'wrong_person',
+  'out_of_office',
+  'unsubscribe',
+  'not_interested',
+  'bounce',
+  'angry_or_sensitive',
+  'unknown_needs_review',
+  'continue_nurture',
+  'pause_out_of_office',
+  'close_not_interested',
+  'close_bad_fit',
+  'close_wrong_person',
+  'close_unsubscribed',
+  'close_bounced',
+  'handoff_required',
+  'call_scheduled',
+  'reactivation_candidate',
+] as const;
+
+const ClassifyReplyOutputSchema = z.object({
+  classification: z.enum(REPLY_CLASSIFICATIONS),
+  confidence: z.number().min(0).max(1),
+  lead_temperature: z.enum(['hot', 'warm', 'cold', 'frozen']),
+  should_auto_reply: z.boolean(),
+  should_create_draft: z.boolean(),
+  should_handoff: z.boolean(),
+  should_stop_sequence: z.boolean(),
+  should_pause: z.boolean(),
+  close_reason: z.string().nullable(),
+  summary: z.string(),
+  detected_pain_points: z.array(z.string()),
+  recommended_next_action: z.string(),
+  reply_subject: z.string().nullable(),
+  reply_body: z.string().nullable(),
+  handoff_summary: z.string().nullable(),
+});
+export type ClassifyReplyOutput = z.infer<typeof ClassifyReplyOutputSchema>;
+
+export async function classifyReply(input: {
+  workspaceId: string;
+  campaignId: string;
+  leadId: string;
+  threadId: string;
+  forceHeavy?: boolean;
+}): Promise<AiActionResult<ClassifyReplyOutput>> {
+  return runAction({
+    workspaceId: input.workspaceId,
+    campaignId: input.campaignId,
+    leadId: input.leadId,
+    threadId: input.threadId,
+    actionType: 'classify_reply',
+    outputSchema: ClassifyReplyOutputSchema,
+    forceHeavy: input.forceHeavy,
+    taskPrompt: `Read the most recent inbound message in the thread and classify it. Return one of the allowed classifications and the recommended next action.
+
+Auto-send is allowed only when ALL of the following are true:
+- workspace.auto_reply_enabled = true
+- confidence >= workspace.auto_reply_confidence_threshold
+- classification is safe (not pricing/legal/contracts/revenue share/loan terms/custom implementation)
+- not angry or sensitive
+- not a high-value lead requiring handoff
+- exit rules allow sending
+
+Always hand off (should_handoff=true, should_auto_reply=false) for: pricing, contracts, legal, revenue share, loan terms, active funding scenario, demo request needing a real human, custom implementation, enterprise opportunity, angry replies, ambiguous high-value cases.
+
+When you choose a draft (should_create_draft=true), populate reply_subject and reply_body.`,
+    jsonSchema: {
+      type: 'object',
+      properties: {
+        classification: { type: 'string', enum: REPLY_CLASSIFICATIONS as unknown as string[] },
+        confidence: { type: 'number', minimum: 0, maximum: 1 },
+        lead_temperature: { type: 'string', enum: ['hot', 'warm', 'cold', 'frozen'] },
+        should_auto_reply: { type: 'boolean' },
+        should_create_draft: { type: 'boolean' },
+        should_handoff: { type: 'boolean' },
+        should_stop_sequence: { type: 'boolean' },
+        should_pause: { type: 'boolean' },
+        close_reason: { type: ['string', 'null'] },
+        summary: { type: 'string' },
+        detected_pain_points: { type: 'array', items: { type: 'string' } },
+        recommended_next_action: { type: 'string' },
+        reply_subject: { type: ['string', 'null'] },
+        reply_body: { type: ['string', 'null'] },
+        handoff_summary: { type: ['string', 'null'] },
+      },
+      required: [
+        'classification',
+        'confidence',
+        'lead_temperature',
+        'should_auto_reply',
+        'should_create_draft',
+        'should_handoff',
+        'should_stop_sequence',
+        'should_pause',
+        'close_reason',
+        'summary',
+        'detected_pain_points',
+        'recommended_next_action',
+        'reply_subject',
+        'reply_body',
+        'handoff_summary',
+      ],
+      additionalProperties: false,
+    },
+  });
+}
+
+// ---------- summarize_thread ----------
+
+const SummarizeThreadOutputSchema = z.object({
+  summary: z.string(),
+  key_points: z.array(z.string()),
+  current_state: z.string(),
+  recommended_next_action: z.string(),
+  confidence: z.number().min(0).max(1),
+});
+export type SummarizeThreadOutput = z.infer<typeof SummarizeThreadOutputSchema>;
+
+export async function summarizeThread(input: {
+  workspaceId: string;
+  campaignId?: string;
+  leadId?: string;
+  threadId: string;
+}): Promise<AiActionResult<SummarizeThreadOutput>> {
+  return runAction({
+    workspaceId: input.workspaceId,
+    campaignId: input.campaignId ?? null,
+    leadId: input.leadId ?? null,
+    threadId: input.threadId,
+    actionType: 'summarize_thread',
+    outputSchema: SummarizeThreadOutputSchema,
+    taskPrompt:
+      'Summarize this email thread. Return a 2-3 sentence summary, 3-6 key points, the current state of the conversation (e.g. "Lead asked for pricing, awaiting response"), and the recommended next action.',
+    jsonSchema: {
+      type: 'object',
+      properties: {
+        summary: { type: 'string' },
+        key_points: { type: 'array', items: { type: 'string' } },
+        current_state: { type: 'string' },
+        recommended_next_action: { type: 'string' },
+        confidence: { type: 'number', minimum: 0, maximum: 1 },
+      },
+      required: ['summary', 'key_points', 'current_state', 'recommended_next_action', 'confidence'],
+      additionalProperties: false,
+    },
+  });
+}
+
+// ---------- summarize_knowledge ----------
+
+const SummarizeKnowledgeOutputSchema = z.object({
+  summary: z.string(),
+  document_type: z.enum([
+    'product_overview',
+    'faq',
+    'pricing',
+    'pitch_deck',
+    'objection_library',
+    'compliance',
+    'case_study',
+    'demo_notes',
+    'uploaded_notes',
+    'other',
+  ]),
+  key_facts: z.array(z.string()),
+  confidence: z.number().min(0).max(1),
+});
+export type SummarizeKnowledgeOutput = z.infer<typeof SummarizeKnowledgeOutputSchema>;
+
+export async function summarizeKnowledge(input: {
+  workspaceId: string;
+  campaignId: string;
+  fileName: string;
+  extractedText: string;
+}): Promise<AiActionResult<SummarizeKnowledgeOutput>> {
+  return runAction({
+    workspaceId: input.workspaceId,
+    campaignId: input.campaignId,
+    actionType: 'summarize_knowledge',
+    outputSchema: SummarizeKnowledgeOutputSchema,
+    taskPrompt: `Summarize this campaign knowledge file. Identify the document_type from the allowed list, write a 2-4 sentence summary, and extract 5-12 key facts that the AI could reference in outbound emails or reply handling.
+
+File name: ${input.fileName}
+
+Extracted text (truncated to first 8000 chars):
+${input.extractedText.slice(0, 8000)}`,
+    jsonSchema: {
+      type: 'object',
+      properties: {
+        summary: { type: 'string' },
+        document_type: {
+          type: 'string',
+          enum: [
+            'product_overview',
+            'faq',
+            'pricing',
+            'pitch_deck',
+            'objection_library',
+            'compliance',
+            'case_study',
+            'demo_notes',
+            'uploaded_notes',
+            'other',
+          ],
+        },
+        key_facts: { type: 'array', items: { type: 'string' } },
+        confidence: { type: 'number', minimum: 0, maximum: 1 },
+      },
+      required: ['summary', 'document_type', 'key_facts', 'confidence'],
+      additionalProperties: false,
+    },
+  });
+}

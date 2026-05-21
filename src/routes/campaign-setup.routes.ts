@@ -104,6 +104,21 @@ export async function registerCampaignSetupRoutes(app: FastifyInstance): Promise
     const input = parseBody(GoalSchema.partial(), req.body);
     return ok({ goal: await setup.upsertGoal(req.workspace!.id, campaignId, input) }, 'Updated');
   });
+  // Ask Claude (Haiku) for a draft suggestion for one goal field. The user
+  // edits the result in the textarea before saving — no DB write here.
+  app.post(`${base}/goal/suggest`, { preHandler: WRITE }, async (req) => {
+    const { campaignId } = parseParams(req.params);
+    const input = parseBody(
+      z.object({ field: z.enum(setup.SUGGESTABLE_GOAL_FIELDS) }),
+      req.body,
+    );
+    const r = await setup.suggestGoalField({
+      workspaceId: req.workspace!.id,
+      campaignId,
+      field: input.field,
+    });
+    return ok(r);
+  });
 
   // ---- exit rules ----
   app.get(`${base}/exit-rules`, { preHandler: READ }, async (req) => {

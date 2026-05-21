@@ -23,7 +23,9 @@ export const GOOGLE_OAUTH_SCOPES = [
   // Calendar — read + write events so the AI can book meetings
   'https://www.googleapis.com/auth/calendar',
   'https://www.googleapis.com/auth/calendar.events',
-  // Drive — only files created or opened by the app
+  // Drive — list user's files (metadata only) so the Lead Source picker can
+  // show their existing sheets, plus access to files the app creates/opens
+  'https://www.googleapis.com/auth/drive.metadata.readonly',
   'https://www.googleapis.com/auth/drive.file',
   // Sheets — read-only, for Lead Source -> Google Sheet imports
   'https://www.googleapis.com/auth/spreadsheets.readonly',

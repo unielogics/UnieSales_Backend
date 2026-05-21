@@ -15,6 +15,7 @@ import { registerKnowledgeRoutes } from './routes/knowledge.routes';
 import { registerLeadSourceRoutes } from './routes/lead-sources.routes';
 import { registerLeadRoutes } from './routes/leads.routes';
 import { registerGmailRoutes } from './routes/gmail.routes';
+import { registerDriveRoutes } from './routes/drive.routes';
 import { registerAiActionRoutes } from './routes/ai-actions.routes';
 import { registerCampaignTrainingRoutes } from './routes/campaign-training.routes';
 import { registerThreadRoutes } from './routes/threads.routes';
@@ -90,6 +91,7 @@ async function main(): Promise<void> {
   await registerLeadSourceRoutes(app);
   await registerLeadRoutes(app);
   await registerGmailRoutes(app);
+  await registerDriveRoutes(app);
   await registerAiActionRoutes(app);
   await registerCampaignTrainingRoutes(app);
   await registerThreadRoutes(app);

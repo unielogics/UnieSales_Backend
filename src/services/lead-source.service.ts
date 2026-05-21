@@ -183,7 +183,7 @@ export interface PreviewResult {
   totalRows: number;
 }
 
-/** Read the first N rows of the source (for the column-mapping UI). CSV only in v1. */
+/** Read the first N rows of the source (for the column-mapping UI). CSV + Google Sheet supported. */
 export async function preview(
   workspaceId: string,
   campaignId: string,
@@ -191,20 +191,28 @@ export async function preview(
   limit = 5,
 ): Promise<PreviewResult> {
   const src = await getById(workspaceId, campaignId, sourceId);
-  if (src.sourceType !== 'csv_upload') {
-    throw new ConflictError('Preview currently supports csv_upload sources only', [
-      { field: 'sourceType', reason: `preview not implemented for ${src.sourceType} (Phase 8 will add google_sheet)` },
+
+  let records: Record<string, string>[];
+  if (src.sourceType === 'csv_upload') {
+    if (!src.uploadedFileUrl) throw new NotFoundError('Uploaded file URL missing');
+    const key = src.uploadedFileUrl.replace(/^s3:\/\/[^/]+\//, '');
+    const buf = await getObjectBuffer(key);
+    records = parseCsvSync(buf.toString('utf-8'), {
+      columns: true,
+      skip_empty_lines: true,
+      relax_quotes: true,
+      relax_column_count: true,
+    }) as Record<string, string>[];
+  } else if (src.sourceType === 'google_sheet') {
+    if (!src.googleSheetId) throw new NotFoundError('Google Sheet ID missing');
+    const { readSheetRows } = await import('./drive.service');
+    records = await readSheetRows(workspaceId, src.googleSheetId, src.googleSheetTab ?? 'Sheet1');
+  } else {
+    throw new ConflictError(`Preview not supported for sourceType ${src.sourceType}`, [
+      { field: 'sourceType', reason: 'use csv_upload or google_sheet' },
     ]);
   }
-  if (!src.uploadedFileUrl) throw new NotFoundError('Uploaded file URL missing');
-  const key = src.uploadedFileUrl.replace(/^s3:\/\/[^/]+\//, '');
-  const buf = await getObjectBuffer(key);
-  const records = parseCsvSync(buf.toString('utf-8'), {
-    columns: true,
-    skip_empty_lines: true,
-    relax_quotes: true,
-    relax_column_count: true,
-  }) as Record<string, string>[];
+
   const first = records[0] ?? {};
   return {
     columns: Object.keys(first),
@@ -242,9 +250,13 @@ export async function importNow(workspaceId: string, campaignId: string, sourceI
       relax_column_count: true,
     }) as Record<string, string>[];
   } else if (src.sourceType === 'google_sheet') {
-    throw new ConflictError('Google Sheet import requires Google OAuth (Phase 8)', [
-      { field: 'sourceType', reason: 'not yet implemented' },
-    ]);
+    if (!src.googleSheetId) {
+      throw new ConflictError('Google Sheet source missing googleSheetId', [
+        { field: 'googleSheetId', reason: 'required' },
+      ]);
+    }
+    const { readSheetRows } = await import('./drive.service');
+    rows = await readSheetRows(workspaceId, src.googleSheetId, src.googleSheetTab ?? 'Sheet1');
   } else if (src.sourceType === 'manual') {
     throw new ConflictError('Manual sources do not support bulk import', [
       { field: 'sourceType', reason: 'add leads via /api/workspaces/:wid/leads' },

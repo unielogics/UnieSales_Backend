@@ -23,7 +23,10 @@ const SYSTEM_FIELDS = [
   'phone',
   'linkedin_url',
   'segment',
+  'source',
   'source_notes',
+  'personalization',
+  'pain_angle',
 ] as const;
 export type SystemField = (typeof SYSTEM_FIELDS)[number];
 
@@ -286,10 +289,27 @@ async function importRows(
   let skippedInvalid = 0;
 
   for (const row of rows) {
+    // Multiple CSV columns can map to the same system field (e.g. "Notes" +
+    // "Why Fit" both → source_notes). Concatenate with " · " in that case so
+    // no operator-curated context gets dropped.
     const mapped: Partial<Record<SystemField, string>> = {};
     for (const [col, val] of Object.entries(row)) {
       const sys = mapping[col];
-      if (sys && val != null && String(val).trim() !== '') mapped[sys] = String(val).trim();
+      if (!sys || val == null) continue;
+      const trimmed = String(val).trim();
+      if (trimmed === '') continue;
+      const existing = mapped[sys];
+      if (existing) {
+        // Free-text fields concatenate; structured fields take the first non-empty value
+        if (sys === 'source_notes' || sys === 'personalization' || sys === 'pain_angle') {
+          mapped[sys] = `${existing} · ${col}: ${trimmed}`;
+        }
+        // else: keep first value
+      } else {
+        mapped[sys] = sys === 'source_notes' || sys === 'personalization' || sys === 'pain_angle'
+          ? `${col}: ${trimmed}`
+          : trimmed;
+      }
     }
     const email = mapped.email?.toLowerCase();
     if (!email || !isLikelyEmail(email)) {
@@ -308,8 +328,10 @@ async function importRows(
         phone: mapped.phone ?? null,
         linkedinUrl: mapped.linkedin_url ?? null,
         segment: mapped.segment ?? null,
-        source: 'import',
+        source: mapped.source ?? 'import',
         sourceNotes: mapped.source_notes ?? null,
+        personalization: mapped.personalization ?? null,
+        painAngle: mapped.pain_angle ?? null,
         status: 'pending_review',
       });
       created++;

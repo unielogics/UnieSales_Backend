@@ -20,6 +20,10 @@ const CreateSchema = z.object({
   maxFollowups: z.number().int().min(0).max(20).optional(),
   followupSchedule: z.unknown().optional(),
   dailySendLimit: z.number().int().positive().max(1000).optional(),
+  sendWindowStart: z.string().regex(/^[0-2]\d:[0-5]\d$/, 'HH:MM 24h').optional(),
+  sendWindowEnd: z.string().regex(/^[0-2]\d:[0-5]\d$/, 'HH:MM 24h').optional(),
+  weekdaysOnly: z.boolean().optional(),
+  handoffEmail: z.string().email().nullable().optional(),
   gmailAccountId: z.string().uuid().optional(),
 });
 

@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, integer, jsonb, timestamp, index } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, text, integer, boolean, jsonb, timestamp, index } from 'drizzle-orm/pg-core';
 import { workspaces } from './workspaces';
 import { gmailAccounts } from './gmail-accounts';
 
@@ -31,6 +31,11 @@ export const campaigns = pgTable(
     followupSchedule: jsonb('followup_schedule'),
 
     dailySendLimit: integer('daily_send_limit').notNull().default(25),
+    // 24-hour clock HH:MM strings — backend validator enforces format
+    sendWindowStart: text('send_window_start').notNull().default('09:00'),
+    sendWindowEnd: text('send_window_end').notNull().default('17:00'),
+    weekdaysOnly: boolean('weekdays_only').notNull().default(true),
+    handoffEmail: text('handoff_email'),
 
     gmailAccountId: uuid('gmail_account_id').references(() => gmailAccounts.id),
 

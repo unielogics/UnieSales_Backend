@@ -60,6 +60,10 @@ export interface AiContextPackage {
     segment: string | null;
     phone: string | null;
     linkedin_url: string | null;
+    city: string | null;
+    state: string | null;
+    street_address: string | null;
+    address_full: string | null;
     source: string | null;
     /** Notes attached at import time from the lead source (CSV/Sheet/manual).
      *  Often contains operator hand-written context like "met at conf X",
@@ -251,6 +255,10 @@ export async function buildContext(req: AiContextRequest): Promise<AiContextPack
           segment: lead.segment,
           phone: lead.phone,
           linkedin_url: lead.linkedinUrl,
+          city: lead.city,
+          state: lead.state,
+          street_address: lead.streetAddress,
+          address_full: lead.addressFull,
           source: lead.source,
           source_notes: lead.sourceNotes,
           lead_score: lead.leadScore,

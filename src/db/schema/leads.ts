@@ -20,6 +20,11 @@ export const leads = pgTable(
     title: text('title'),
     linkedinUrl: text('linkedin_url'),
 
+    city: text('city'),
+    state: text('state'),
+    streetAddress: text('street_address'),
+    addressFull: text('address_full'),
+
     segment: text('segment'),
     source: text('source'),
     sourceUrl: text('source_url'),

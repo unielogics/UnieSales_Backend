@@ -58,6 +58,13 @@ export interface AiContextPackage {
     website: string | null;
     title: string | null;
     segment: string | null;
+    phone: string | null;
+    linkedin_url: string | null;
+    source: string | null;
+    /** Notes attached at import time from the lead source (CSV/Sheet/manual).
+     *  Often contains operator hand-written context like "met at conf X",
+     *  "interested in Y", "follow up about Z" — high-signal for the AI. */
+    source_notes: string | null;
     lead_score: number;
     status: string;
     personalization: string | null;
@@ -242,6 +249,10 @@ export async function buildContext(req: AiContextRequest): Promise<AiContextPack
           website: lead.website,
           title: lead.title,
           segment: lead.segment,
+          phone: lead.phone,
+          linkedin_url: lead.linkedinUrl,
+          source: lead.source,
+          source_notes: lead.sourceNotes,
           lead_score: lead.leadScore,
           status: lead.status,
           personalization: lead.personalization,

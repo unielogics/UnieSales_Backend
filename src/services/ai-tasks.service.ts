@@ -28,7 +28,7 @@ export async function scoreLead(input: {
     actionType: 'score_lead',
     outputSchema: ScoreLeadOutputSchema,
     taskPrompt:
-      'Score this lead 0–100 based on fit with the campaign target_audience, primary_goal, and playbook buyer_persona. Use the lead\'s company, title, segment, and website to assess fit. Provide reasoning and a fit bucket.',
+      'Score this lead 0–100 based on fit with the campaign target_audience, primary_goal, and playbook buyer_persona. Use the lead\'s company, title, segment, website, AND source + source_notes — the operator often writes hand-curated notes there (e.g. "met at X conference", "interested in Y", "referred by Z") that should heavily inform the score and reasoning. If source_notes contains explicit buying signals, score accordingly. Provide reasoning and a fit bucket.',
     jsonSchema: {
       type: 'object',
       properties: {
@@ -67,7 +67,7 @@ export async function generateEmail(input: {
     leadId: input.leadId,
     actionType: 'generate_email',
     outputSchema: GenerateEmailOutputSchema,
-    taskPrompt: `Draft a ${stage} outbound email for this lead. Use playbook.primary_hook and primary_cta. Reference one specific detail about the lead (company/title/website). Keep it under 120 words. No invented claims, pricing, or guarantees.`,
+    taskPrompt: `Draft a ${stage} outbound email for this lead. Use playbook.primary_hook and primary_cta. Reference one specific detail about the lead — prefer source_notes if it contains useful context (e.g. how they were sourced, what they expressed interest in, who referred them), otherwise fall back to company/title/website. If source_notes mentions a specific topic or pain, weave that in naturally. Keep it under 120 words. No invented claims, pricing, or guarantees.`,
     jsonSchema: {
       type: 'object',
       properties: {

@@ -6,6 +6,14 @@ import { ok } from '../services/response.service';
 import { NotFoundError, UnauthorizedError, ValidationError } from '../utils/errors';
 import * as workspaceService from '../services/workspace.service';
 
+const HandoffRuleSchema = z.object({
+  id: z.string().min(1).max(64),
+  text: z.string().min(1).max(500),
+  enabled: z.boolean(),
+  isDefault: z.boolean(),
+  tone: z.enum(['info', 'warning', 'danger']).optional(),
+});
+
 const CreateSchema = z.object({
   name: z.string().min(1).max(120),
   companyName: z.string().min(1).max(200),
@@ -22,6 +30,7 @@ const CreateSchema = z.object({
 
 const UpdateSchema = CreateSchema.partial().extend({
   isActive: z.boolean().optional(),
+  handoffRules: z.array(HandoffRuleSchema).max(100).optional(),
 });
 
 function parse<T extends z.ZodTypeAny>(schema: T, body: unknown): z.infer<T> {

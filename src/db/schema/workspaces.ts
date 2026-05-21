@@ -1,4 +1,17 @@
-import { pgTable, uuid, text, boolean, numeric, timestamp, index } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, text, boolean, numeric, jsonb, timestamp, index } from 'drizzle-orm/pg-core';
+
+// Per-workspace handoff trigger. The AI checks these conditions when classifying
+// inbound replies; any match → flip lead to handoff_required + ai_owner=false.
+// Stored as a JSONB array so users can add / remove / edit / toggle each rule
+// from Settings without a migration.
+export type HandoffRule = {
+  id: string;
+  text: string;
+  enabled: boolean;
+  isDefault: boolean;
+  // 'info' | 'warning' | 'danger' — UI tone, not load-bearing on the AI side.
+  tone?: 'info' | 'warning' | 'danger';
+};
 
 export const workspaces = pgTable(
   'workspaces',
@@ -23,6 +36,8 @@ export const workspaces = pgTable(
       precision: 4,
       scale: 3,
     }).notNull().default('0.850'),
+
+    handoffRules: jsonb('handoff_rules').$type<HandoffRule[]>().notNull().default([]),
 
     isActive: boolean('is_active').notNull().default(true),
 

@@ -1,6 +1,11 @@
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { getDb } from '../config/db';
-import { workspaces, type NewWorkspace, type Workspace } from '../db/schema/workspaces';
+import {
+  workspaces,
+  type HandoffRule,
+  type NewWorkspace,
+  type Workspace,
+} from '../db/schema/workspaces';
 import { workspaceMembers, type WorkspaceRole } from '../db/schema/workspace-members';
 import { campaigns } from '../db/schema/campaigns';
 import { leads } from '../db/schema/leads';
@@ -32,11 +37,32 @@ export async function getById(workspaceId: string): Promise<Workspace | null> {
   return rows[0] ?? null;
 }
 
+/**
+ * Default handoff rules seeded on workspace creation. Users can delete or
+ * customise these via Settings → Handoff rules; the column is just a JSONB.
+ */
+const DEFAULT_HANDOFF_RULES: HandoffRule[] = [
+  { id: 'hr-pricing', text: 'Pricing question asked specifically', enabled: true, isDefault: true, tone: 'warning' },
+  { id: 'hr-contract', text: 'Custom contract / SOW requested', enabled: true, isDefault: true, tone: 'warning' },
+  { id: 'hr-rates', text: 'Loan terms or rates requested', enabled: true, isDefault: true, tone: 'warning' },
+  { id: 'hr-sentiment', text: 'Sentiment turns hostile', enabled: true, isDefault: true, tone: 'danger' },
+  { id: 'hr-low-conf', text: 'AI confidence drops below 70%', enabled: true, isDefault: true, tone: 'info' },
+  { id: 'hr-competitor', text: 'Competitor named without counter', enabled: true, isDefault: true, tone: 'info' },
+  { id: 'hr-enterprise', text: 'Enterprise (1000+ employees) inbound', enabled: true, isDefault: true, tone: 'info' },
+];
+
 /** Create a workspace and add the caller as owner in one transaction. */
 export async function create(input: Omit<NewWorkspace, 'id' | 'createdAt' | 'updatedAt'>, ownerUserId: string): Promise<Workspace> {
   const db = getDb();
   return db.transaction(async (tx) => {
-    const [ws] = await tx.insert(workspaces).values(input).returning();
+    const [ws] = await tx
+      .insert(workspaces)
+      .values({
+        // Seed default handoff rules unless the caller already provided some
+        handoffRules: input.handoffRules ?? DEFAULT_HANDOFF_RULES,
+        ...input,
+      })
+      .returning();
     if (!ws) throw new Error('failed to insert workspace');
     await tx.insert(workspaceMembers).values({
       workspaceId: ws.id,

@@ -239,5 +239,11 @@ Output ONLY the JSON. No prose, no markdown fence.`;
     });
   }
 
+  // Stamp the campaign so the builder Test step + launch checklist know a run happened.
+  await db
+    .update(campaigns)
+    .set({ lastTestedAt: new Date(), updatedAt: new Date() })
+    .where(eq(campaigns.id, input.campaignId));
+
   return { ran: results.length, results };
 }

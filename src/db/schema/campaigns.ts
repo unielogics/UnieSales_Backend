@@ -34,6 +34,10 @@ export const campaigns = pgTable(
 
     gmailAccountId: uuid('gmail_account_id').references(() => gmailAccounts.id),
 
+    // Set by the Test step's /test endpoint. Drives the "Test reviewed" check
+    // in the launch checklist and the Test builder step's done state.
+    lastTestedAt: timestamp('last_tested_at', { withTimezone: false }),
+
     createdAt: timestamp('created_at', { withTimezone: false }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: false }).notNull().defaultNow(),
   },

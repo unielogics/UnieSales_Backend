@@ -78,22 +78,38 @@ export async function registerGmailRoutes(app: FastifyInstance): Promise<void> {
   });
 
   // ---- OAuth callback ----
-  // GOOGLE_REDIRECT_URI must point here (https://api.<domain>/api/auth/google/callback)
+  // GOOGLE_REDIRECT_URI must point here (https://api.<domain>/api/auth/google/callback).
+  // After exchanging the code we redirect the user's BROWSER back to the
+  // frontend Settings page — they should never see the raw API response.
   app.get('/api/auth/google/callback', async (req, reply) => {
+    const e = env();
+    const frontend = e.FRONTEND_URL || 'https://app.uniesales.com';
     const q = CallbackQuery.parse(req.query);
+
     if (q.error) {
-      reply.code(400);
-      return fail(`Google returned error: ${q.error}`);
+      return reply.redirect(
+        `${frontend}/workspaces?gmail_error=${encodeURIComponent(q.error)}`,
+      );
     }
     if (!q.code || !q.state) {
-      reply.code(400);
-      return fail('Missing code or state in callback');
+      return reply.redirect(`${frontend}/workspaces?gmail_error=missing_code_or_state`);
     }
-    const account = await gmailService.handleOAuthCallback(q.code, q.state);
-    return ok(
-      { gmailAccount: { id: account.id, email: account.email, workspaceId: account.workspaceId } },
-      'Gmail account connected',
-    );
+
+    try {
+      const account = await gmailService.handleOAuthCallback(q.code, q.state);
+      // Land back on the workspace's Settings → Connected Google accounts
+      return reply.redirect(
+        `${frontend}/workspaces/${account.workspaceId}/settings?google_connected=${encodeURIComponent(
+          account.email,
+        )}`,
+      );
+    } catch (err) {
+      req.log.error({ err }, 'gmail oauth callback failed');
+      const msg = err instanceof Error ? err.message : 'unknown_error';
+      return reply.redirect(
+        `${frontend}/workspaces?gmail_error=${encodeURIComponent(msg)}`,
+      );
+    }
   });
 
   // ---- list / detail / sync / pause / send-limits ----

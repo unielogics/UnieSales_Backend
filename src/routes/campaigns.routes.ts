@@ -119,12 +119,15 @@ export async function registerCampaignRoutes(app: FastifyInstance): Promise<void
     },
   );
 
-  // /test will run test_scenarios through the AI in Phase 9; stub returns scenario list
+  // Run 5 synthetic reply scenarios through the playbook to preview AI behaviour
   app.post(
     '/api/workspaces/:workspaceId/campaigns/:campaignId/test',
     { preHandler: ADMIN_SCOPED_PREHANDLERS },
-    async () => {
-      return ok({ ran: 0, results: [] }, 'Test stub — wired up with AI in Phase 9');
+    async (req) => {
+      const { campaignId } = parseCampaignParams(req.params);
+      const { runTest } = await import('../services/campaign-test.service');
+      const r = await runTest({ workspaceId: req.workspace!.id, campaignId });
+      return ok(r);
     },
   );
 }

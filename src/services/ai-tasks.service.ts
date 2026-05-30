@@ -28,7 +28,7 @@ export async function scoreLead(input: {
     actionType: 'score_lead',
     outputSchema: ScoreLeadOutputSchema,
     taskPrompt:
-      'Score this lead 0–100 based on fit with the campaign target_audience, primary_goal, and playbook buyer_persona. Use the lead\'s company, title, segment, website, AND source + source_notes — the operator often writes hand-curated notes there (e.g. "met at X conference", "interested in Y", "referred by Z") that should heavily inform the score and reasoning. If source_notes contains explicit buying signals, score accordingly. Provide reasoning and a fit bucket.',
+      'Score this lead 0–100 based on fit with the campaign target_audience, primary_goal, and playbook buyer_persona. Use the lead\'s company, title, segment, website, AND source + source_notes — the operator often writes hand-curated notes there (e.g. "met at X conference", "interested in Y", "referred by Z") that should heavily inform the score and reasoning. ALSO inspect lead.custom_fields — these are operator-defined columns from the CSV/Sheet import (per-campaign, schema-less; example keys: fleet_size, wms_in_use, revenue_range, fit_signal). Treat any value there as high-signal qualification data and weight it heavily when present. If source_notes or custom_fields contain explicit buying signals, score accordingly. Provide reasoning and a fit bucket.',
     jsonSchema: {
       type: 'object',
       properties: {
@@ -43,12 +43,57 @@ export async function scoreLead(input: {
   });
 }
 
+// ---------- classify_lead (lightweight triage) ----------
+
+const ClassifyLeadOutputSchema = z.object({
+  temperature: z.enum(['hot', 'warm', 'cold', 'frozen']),
+  intent_labels: z.array(z.string()).max(8),
+  summary: z.string().min(1).max(800),
+  confidence: z.number().min(0).max(1),
+});
+export type ClassifyLeadOutput = z.infer<typeof ClassifyLeadOutputSchema>;
+
+/**
+ * Triage classification for an inbound lead. Reads the same ai-context
+ * package as score_lead but produces a different shape: a temperature
+ * bucket the runtime uses to pick the next action, plus intent labels
+ * (e.g. "warehouse_audit", "wants_pricing", "exploring", "wrong_person")
+ * that surface in the Intelligence tab and feed the AI Behavior rules.
+ */
+export async function classifyLead(input: {
+  workspaceId: string;
+  campaignId: string;
+  leadId: string;
+}): Promise<AiActionResult<ClassifyLeadOutput>> {
+  return runAction({
+    workspaceId: input.workspaceId,
+    campaignId: input.campaignId,
+    leadId: input.leadId,
+    actionType: 'classify_lead',
+    outputSchema: ClassifyLeadOutputSchema,
+    taskPrompt:
+      'Classify this lead for triage. Inputs: lead.company_name, contact_name, title, segment, source, source_notes, custom_fields (which on inbound rows contains the full form payload at .fields and a flat key→value map at .flat — pay particular attention to fields like monthlyVolume, integrationTimeline, auditType, currentWms, providerType, persona, partner_type, mode, audit_type). Output: (1) temperature — "hot" for explicit buying signals or urgent timeline, "warm" for qualified persona + relevant pain, "cold" for low/no signal but still on-ICP, "frozen" for clear bad-fit / wrong-person / hobbyist / abusive. (2) intent_labels — 2–6 short snake_case labels (e.g. "wants_demo", "wants_pricing", "exploring", "audit_request", "partner_inquiry", "qualified_persona", "low_volume", "wrong_person"). (3) summary — 2–3 sentences for the Intelligence tab: who they are, why they showed up, the strongest signal you saw. (4) confidence — your certainty in the classification.',
+    jsonSchema: {
+      type: 'object',
+      properties: {
+        temperature: { type: 'string', enum: ['hot', 'warm', 'cold', 'frozen'] },
+        intent_labels: { type: 'array', items: { type: 'string' }, maxItems: 8 },
+        summary: { type: 'string' },
+        confidence: { type: 'number', minimum: 0, maximum: 1 },
+      },
+      required: ['temperature', 'intent_labels', 'summary', 'confidence'],
+      additionalProperties: false,
+    },
+  });
+}
+
 // ---------- generate_email ----------
 
 const GenerateEmailOutputSchema = z.object({
   subject: z.string().min(1).max(150),
   body: z.string().min(1).max(4000),
   personalization_used: z.array(z.string()),
+  attachment_file_ids: z.array(z.string()),
   confidence: z.number().min(0).max(1),
   reasoning: z.string(),
 });
@@ -59,25 +104,54 @@ export async function generateEmail(input: {
   campaignId: string;
   leadId: string;
   stage?: 'cold' | 'followup_1' | 'followup_2' | 'followup_3' | 'breakup';
+  /** Outbound channel. SMS forces short copy, no subject, no footer, no attachments. */
+  channel?: 'email' | 'sms';
 }): Promise<AiActionResult<GenerateEmailOutput>> {
   const stage = input.stage ?? 'cold';
+  const channel = input.channel ?? 'email';
+  const smsBlock = channel === 'sms'
+    ? `\n\nSMS MODE (override the above):\n- This is an SMS, not an email. body MUST be a single short message — under 300 characters, ideally under 160. No subject line, no greeting block, no signature, no footer, no quoted lines, no attachments. Return an empty array for attachment_file_ids. Conversational, one ask. Subject is ignored downstream; return any short tag.`
+    : '';
   return runAction({
     workspaceId: input.workspaceId,
     campaignId: input.campaignId,
     leadId: input.leadId,
     actionType: 'generate_email',
     outputSchema: GenerateEmailOutputSchema,
-    taskPrompt: `Draft a ${stage} outbound email for this lead. Use playbook.primary_hook and primary_cta. Reference one specific detail about the lead — prefer source_notes if it contains useful context (e.g. how they were sourced, what they expressed interest in, who referred them), otherwise fall back to company/title/website. If source_notes mentions a specific topic or pain, weave that in naturally. Keep it under 120 words. No invented claims, pricing, or guarantees.`,
+    taskPrompt: `Draft a ${stage} outbound email for this lead, written in the FIRST PERSON as the human sender. It must read like a real person typed it — never like a company or a bot. Never describe the company in the third person, and never sign off with the company name.
+
+VOICE — match the operator's own writing style:
+- Follow workspace.email_style_guide if it is present.
+- Study workspace.email_samples (real emails the operator wrote) and mimic their voice, sentence rhythm, warmth, and structure — these samples define the target style.
+- Plain, human, conversational; short sentences; no corporate or marketing jargon, no buzzwords, no hype.
+
+GREETING:
+- Prefer lead.first_name when present (e.g. "Hi Sarah,"). Otherwise use the first token of lead.contact_name. Never use the email local-part as a name.
+
+CONTENT:
+- Use playbook.primary_hook and primary_cta.
+- Reference one specific detail about the lead — prefer source_notes (how they were sourced, what they care about, who referred them) or any value in lead.custom_fields (operator-defined CSV columns like fleet_size, wms_in_use, revenue_range, AND inbound-form fields like monthlyVolume, integrationTimeline, auditType, currentWms, providerType, persona, partner_type — these are CAMPAIGN-SPECIFIC qualification data and often the strongest hook); otherwise fall back to company/title/website. When you reference a custom_fields value, weave it in like a human who looked them up would ("you're running ~200 trucks across 3 yards") — never quote raw keys or dump JSON.
+- Keep it under 120 words. No invented claims, pricing, or guarantees.
+
+SIGN-OFF:
+- If workspace.has_footer is true: do NOT write any closing signature, name, title, or company line — a footer is appended automatically. End on your final sentence.
+- If workspace.has_footer is false: end with a brief first-person sign-off using only the sender's first name (from workspace.default_sender_name).
+
+ATTACHMENTS:
+- context.attachments lists marketing files (PDFs, app one-pagers, decks) you MAY attach. Each has an id, title, document_type, and summary.
+- Attach a file ONLY when it genuinely helps THIS email and stage — e.g. introducing the mobile app on a cold email. Don't attach on every follow-up; don't attach if nothing fits.
+- Put the chosen file id(s) in attachment_file_ids (empty array if none). When you attach something, reference it naturally in the body in one short line (e.g. "I've attached a quick overview of the app"). If attachment_file_ids is empty, never mention an attachment.${smsBlock}`,
     jsonSchema: {
       type: 'object',
       properties: {
         subject: { type: 'string' },
         body: { type: 'string' },
         personalization_used: { type: 'array', items: { type: 'string' } },
+        attachment_file_ids: { type: 'array', items: { type: 'string' } },
         confidence: { type: 'number', minimum: 0, maximum: 1 },
         reasoning: { type: 'string' },
       },
-      required: ['subject', 'body', 'personalization_used', 'confidence', 'reasoning'],
+      required: ['subject', 'body', 'personalization_used', 'attachment_file_ids', 'confidence', 'reasoning'],
       additionalProperties: false,
     },
   });
@@ -130,6 +204,10 @@ const ClassifyReplyOutputSchema = z.object({
   reply_subject: z.string().nullable(),
   reply_body: z.string().nullable(),
   handoff_summary: z.string().nullable(),
+  proposed_time: z.string().nullable(),
+  attachment_file_ids: z.array(z.string()),
+  /** 'email' / 'sms' if the lead asked to be contacted on the other channel; null otherwise. */
+  prefer_channel: z.enum(['email', 'sms']).nullable(),
 });
 export type ClassifyReplyOutput = z.infer<typeof ClassifyReplyOutputSchema>;
 
@@ -139,7 +217,17 @@ export async function classifyReply(input: {
   leadId: string;
   threadId: string;
   forceHeavy?: boolean;
+  /** Anchors relative-date parsing for scheduling. */
+  schedulingHint?: { nowIso: string; timezone: string };
+  /** Conversation channel — SMS replies must be short and signature-free. */
+  channel?: 'email' | 'sms';
 }): Promise<AiActionResult<ClassifyReplyOutput>> {
+  const schedulingBlock = input.schedulingHint
+    ? `\n- Current time is ${input.schedulingHint.nowIso}. The operator schedules in timezone ${input.schedulingHint.timezone} — resolve relative dates ("tomorrow", "next Tuesday", "3pm") against that.`
+    : '';
+  const smsBlock = input.channel === 'sms'
+    ? `\n\nSMS REPLY MODE:\n- The conversation is over SMS. reply_subject MUST be null. reply_body MUST be a single short message under 300 characters (ideally under 160) — no greeting block, no signature, no quoted lines, no attachments. attachment_file_ids MUST be an empty array.`
+    : '';
   return runAction({
     workspaceId: input.workspaceId,
     campaignId: input.campaignId,
@@ -160,7 +248,21 @@ Auto-send is allowed only when ALL of the following are true:
 
 Always hand off (should_handoff=true, should_auto_reply=false) for: pricing, contracts, legal, revenue share, loan terms, active funding scenario, demo request needing a real human, custom implementation, enterprise opportunity, angry replies, ambiguous high-value cases.
 
-When you choose a draft (should_create_draft=true), populate reply_subject and reply_body.`,
+When you choose a draft (should_create_draft=true), populate reply_subject and reply_body. Write reply_body in the FIRST PERSON as the human sender — it must sound like a real person, matching workspace.email_style_guide and the voice of workspace.email_samples. If workspace.has_footer is true, do not add any signature or sign-off; otherwise close with the sender's first name only.
+
+SCHEDULING:
+- If the lead asks to meet / talk / hop on a call but has NOT committed to a specific time, classify as meeting_request and set proposed_time to null. Keep reply_body short and warm — do NOT invent or propose specific times yourself; the system appends real open calendar slots automatically.
+- If the lead picked or proposed a specific date and time (including choosing one of the options we offered), classify as call_scheduled and return proposed_time as an ISO 8601 datetime WITH a timezone offset (e.g. "2026-05-27T14:00:00-04:00"). reply_body should warmly confirm.
+- proposed_time must be null for every other classification.${schedulingBlock}
+
+ATTACHMENTS:
+- context.attachments lists marketing files (PDFs, app one-pagers, decks) you MAY attach to a reply. Each has an id, title, document_type, summary.
+- When drafting a reply, attach a file ONLY when it directly answers what the lead asked — e.g. attach the app overview when they ask "what does the app do?". Otherwise attach nothing.
+- Put chosen file id(s) in attachment_file_ids (empty array if none). When you attach something, reference it in reply_body in one short line. Never mention an attachment when attachment_file_ids is empty.${smsBlock}
+
+CHANNEL PREFERENCE:
+- If the reply explicitly asks to switch contact channel ("email me", "send by email", "send to my email", "can you text me", "by text", "shoot me a text"), set prefer_channel accordingly ('email' or 'sms'). Otherwise null.
+- The switch affects FUTURE outreach only — your current auto-reply still goes back on whichever channel they messaged you on.`,
     jsonSchema: {
       type: 'object',
       properties: {
@@ -179,6 +281,9 @@ When you choose a draft (should_create_draft=true), populate reply_subject and r
         reply_subject: { type: ['string', 'null'] },
         reply_body: { type: ['string', 'null'] },
         handoff_summary: { type: ['string', 'null'] },
+        proposed_time: { type: ['string', 'null'] },
+        attachment_file_ids: { type: 'array', items: { type: 'string' } },
+        prefer_channel: { type: ['string', 'null'], enum: ['email', 'sms', null] },
       },
       required: [
         'classification',
@@ -196,6 +301,9 @@ When you choose a draft (should_create_draft=true), populate reply_subject and r
         'reply_subject',
         'reply_body',
         'handoff_summary',
+        'proposed_time',
+        'attachment_file_ids',
+        'prefer_channel',
       ],
       additionalProperties: false,
     },
@@ -329,6 +437,93 @@ ${input.trainingTranscript ? `\n## Training transcript\n\n${input.trainingTransc
   });
 }
 
+// ---------- revise_playbook (heavy) ----------
+
+/**
+ * Apply operator revision instructions to an existing playbook. Same output
+ * shape as generate_playbook so the upsert path is shared — the difference is
+ * the prompt: instead of synthesizing from scratch, the AI starts from the
+ * current playbook and surgically applies the requested changes while
+ * preserving everything else.
+ */
+export async function revisePlaybook(input: {
+  workspaceId: string;
+  campaignId: string;
+  currentPlaybook: Record<string, unknown>;
+  instructions: string;
+}): Promise<AiActionResult<GeneratePlaybookOutput>> {
+  return runAction({
+    workspaceId: input.workspaceId,
+    campaignId: input.campaignId,
+    actionType: 'revise_playbook',
+    outputSchema: GeneratePlaybookOutputSchema,
+    forceHeavy: true,
+    taskPrompt: `Revise the campaign playbook below according to the operator's instructions.
+
+REVISION RULES:
+- Apply the instructions surgically. Sections the operator did NOT mention must be returned unchanged (verbatim from the current playbook).
+- Preserve voice, tone, and structure. Don't rewrite working language unless the operator asked you to.
+- Never invent pricing, guarantees, legal terms, revenue shares, or unsupported claims. If the instructions ask for something unsupported, push back in confidence/reasoning and leave that section unchanged.
+- Return the FULL playbook in the output schema — every field, including the unchanged ones. The frontend replaces the whole playbook on save.
+
+## Operator instructions
+
+${input.instructions}
+
+## Current playbook
+
+\`\`\`json
+${JSON.stringify(input.currentPlaybook, null, 2)}
+\`\`\``,
+    jsonSchema: {
+      type: 'object',
+      properties: {
+        campaign_thesis: { type: 'string' },
+        buyer_persona: { type: 'string' },
+        target_pains: { type: 'string' },
+        value_proposition: { type: 'string' },
+        primary_hook: { type: 'string' },
+        primary_cta: { type: 'string' },
+        objection_map: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              objection: { type: 'string' },
+              response: { type: 'string' },
+              handoff: { type: 'boolean' },
+            },
+            required: ['objection', 'response', 'handoff'],
+            additionalProperties: false,
+          },
+        },
+        allowed_claims: { type: 'string' },
+        prohibited_claims: { type: 'string' },
+        handoff_rules: { type: 'string' },
+        exit_rules: { type: 'string' },
+        ai_operating_instructions: { type: 'string' },
+        confidence: { type: 'number', minimum: 0, maximum: 1 },
+      },
+      required: [
+        'campaign_thesis',
+        'buyer_persona',
+        'target_pains',
+        'value_proposition',
+        'primary_hook',
+        'primary_cta',
+        'objection_map',
+        'allowed_claims',
+        'prohibited_claims',
+        'handoff_rules',
+        'exit_rules',
+        'ai_operating_instructions',
+        'confidence',
+      ],
+      additionalProperties: false,
+    },
+  });
+}
+
 // ---------- generate_demo_guide (heavy) ----------
 
 const GenerateDemoGuideOutputSchema = z.object({
@@ -359,6 +554,72 @@ export async function generateDemoGuide(input: {
     taskPrompt: `Produce a demo / discovery call playbook for this campaign. Pull from the campaign goal, playbook (if it exists), and the training transcript if provided. Keep templates editable and concise.
 
 ${input.trainingTranscript ? `\n## Training transcript\n\n${input.trainingTranscript}\n` : ''}`,
+    jsonSchema: {
+      type: 'object',
+      properties: {
+        demo_goal: { type: 'string' },
+        pre_call_confirmation_template: { type: 'string' },
+        call_agenda: { type: 'string' },
+        discovery_questions: { type: 'array', items: { type: 'string' } },
+        demo_flow: { type: 'array', items: { type: 'string' } },
+        qualification_questions: { type: 'array', items: { type: 'string' } },
+        post_call_followup_template: { type: 'string' },
+        proposal_request_checklist: { type: 'array', items: { type: 'string' } },
+        handoff_summary_template: { type: 'string' },
+        confidence: { type: 'number', minimum: 0, maximum: 1 },
+      },
+      required: [
+        'demo_goal',
+        'pre_call_confirmation_template',
+        'call_agenda',
+        'discovery_questions',
+        'demo_flow',
+        'qualification_questions',
+        'post_call_followup_template',
+        'proposal_request_checklist',
+        'handoff_summary_template',
+        'confidence',
+      ],
+      additionalProperties: false,
+    },
+  });
+}
+
+// ---------- revise_demo_guide (heavy) ----------
+
+/**
+ * Apply operator revision instructions to an existing demo guide. Same
+ * output shape as generate_demo_guide for shared upsert.
+ */
+export async function reviseDemoGuide(input: {
+  workspaceId: string;
+  campaignId: string;
+  currentDemoGuide: Record<string, unknown>;
+  instructions: string;
+}): Promise<AiActionResult<GenerateDemoGuideOutput>> {
+  return runAction({
+    workspaceId: input.workspaceId,
+    campaignId: input.campaignId,
+    actionType: 'revise_demo_guide',
+    outputSchema: GenerateDemoGuideOutputSchema,
+    forceHeavy: true,
+    taskPrompt: `Revise the demo / discovery call guide below according to the operator's instructions.
+
+REVISION RULES:
+- Apply the instructions surgically. Sections the operator did NOT mention must be returned unchanged (verbatim from the current guide).
+- Preserve voice, tone, and structure. Don't rewrite working templates unless the operator asked you to.
+- Keep templates concise and editable. Never invent pricing, guarantees, or unsupported claims.
+- Return the FULL demo guide in the output schema — every field, including the unchanged ones.
+
+## Operator instructions
+
+${input.instructions}
+
+## Current demo guide
+
+\`\`\`json
+${JSON.stringify(input.currentDemoGuide, null, 2)}
+\`\`\``,
     jsonSchema: {
       type: 'object',
       properties: {

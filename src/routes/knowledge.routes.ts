@@ -21,6 +21,7 @@ const UpdateSchema = z.object({
   documentType: z.string().optional(),
   isActive: z.boolean().optional(),
   summary: z.string().optional(),
+  attachToEmails: z.boolean().optional(),
 });
 
 function parseBody<T extends z.ZodTypeAny>(s: T, body: unknown): z.infer<T> {
@@ -115,6 +116,7 @@ export async function registerKnowledgeRoutes(app: FastifyInstance): Promise<voi
           documentType,
           isActive: patch.isActive,
           summary: patch.summary,
+          attachToEmails: patch.attachToEmails,
         }),
       },
       'Updated',

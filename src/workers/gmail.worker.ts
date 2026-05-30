@@ -11,13 +11,14 @@ import { initDb, getDb, closeDb } from '../config/db';
 import { createLogger } from '../config/logger';
 import { gmailAccounts } from '../db/schema/gmail-accounts';
 import { authClientForAccount, syncThread } from '../services/gmail.service';
+import { processInboundReply } from '../services/reply.service';
 
 const TICK_MS = 5 * 60 * 1000;
 const log = createLogger(process.env.LOG_LEVEL ?? 'info').child({ worker: 'gmail' });
 
 let shouldStop = false;
 
-async function pollAccount(account: typeof gmailAccounts.$inferSelect): Promise<{ threadsSynced: number; messagesSynced: number }> {
+async function pollAccount(account: typeof gmailAccounts.$inferSelect): Promise<{ threadsSynced: number; messagesSynced: number; repliesHandled: number }> {
   const client = await authClientForAccount(account);
   const gmail = google.gmail({ version: 'v1', auth: client });
 
@@ -35,16 +36,31 @@ async function pollAccount(account: typeof gmailAccounts.$inferSelect): Promise<
 
   let threadsSynced = 0;
   let messagesSynced = 0;
+  const newReplies: NonNullable<Awaited<ReturnType<typeof syncThread>>['newInboundReply']>[] = [];
   for (const t of threads) {
     if (!t.id) continue;
     const r = await syncThread(account.workspaceId, account.id, t.id);
     threadsSynced++;
     messagesSynced += r.messagesSynced;
+    if (r.newInboundReply) newReplies.push(r.newInboundReply);
+  }
+
+  // A campaign lead replied → let the AI classify, route, and reply/queue a
+  // draft. One failed reply must not abort the others or the sync.
+  let repliesHandled = 0;
+  for (const rep of newReplies) {
+    try {
+      const res = await processInboundReply({ workspaceId: account.workspaceId, ...rep });
+      repliesHandled++;
+      log.info({ accountId: account.id, leadId: rep.leadId, ...res }, 'inbound reply handled');
+    } catch (err) {
+      log.error({ err, accountId: account.id, leadId: rep.leadId }, 'inbound reply handling failed');
+    }
   }
 
   const db = getDb();
   await db.update(gmailAccounts).set({ lastSyncAt: new Date(), updatedAt: new Date() }).where(eq(gmailAccounts.id, account.id));
-  return { threadsSynced, messagesSynced };
+  return { threadsSynced, messagesSynced, repliesHandled };
 }
 
 async function main() {

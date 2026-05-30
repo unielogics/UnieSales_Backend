@@ -1,14 +1,18 @@
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull } from 'drizzle-orm';
 import { google, type Auth } from 'googleapis';
 import jwt from 'jsonwebtoken';
 import { getDb } from '../config/db';
 import { env } from '../config/env';
 import { GOOGLE_OAUTH_SCOPES, newOAuthClient, clientWithTokens } from '../config/google';
 import { gmailAccounts, type GmailAccount, type NewGmailAccount } from '../db/schema/gmail-accounts';
+import { workspaces } from '../db/schema/workspaces';
+import { leads } from '../db/schema/leads';
 import { emailThreads, type EmailThread } from '../db/schema/email-threads';
 import { emailMessages, type NewEmailMessage } from '../db/schema/email-messages';
+import { campaignKnowledgeFiles } from '../db/schema/campaign-knowledge-files';
 import { ConflictError, NotFoundError, ValidationError } from '../utils/errors';
 import { encrypt, decrypt } from './crypto.service';
+import { getObjectBuffer } from './s3.service';
 
 const STATE_TTL_SECONDS = 600;
 
@@ -170,26 +174,300 @@ export async function authClientForAccount(account: GmailAccount): Promise<Auth.
 
 // ---- Send / draft ----
 
+// RFC 2047 encoded-word — required for non-ASCII characters in mail headers
+// (an em-dash in a raw header is what produced the `Ã¢Â€Â"` mojibake).
+function encodeHeaderWord(s: string): string {
+  if (/^[\x20-\x7E]*$/.test(s)) return s; // pure printable ASCII — leave as-is
+  return `=?UTF-8?B?${Buffer.from(s, 'utf-8').toString('base64')}?=`;
+}
+
+// Encode the display-name portion of a "Name <email>" address header.
+function encodeAddressHeader(value: string): string {
+  const m = value.match(/^\s*(.*?)\s*<([^>]+)>\s*$/);
+  if (!m) return value;
+  const name = (m[1] ?? '').trim();
+  const email = (m[2] ?? '').trim();
+  return name ? `${encodeHeaderWord(name)} <${email}>` : `<${email}>`;
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Plain-text AI body → simple HTML (escape, newlines → <br>).
+function plainToHtml(body: string): string {
+  return escapeHtml(body).replace(/\r?\n/g, '<br>\n');
+}
+
+// Strip an HTML footer down to a plain-text approximation for the text/plain part.
+function htmlToPlain(html: string): string {
+  return html
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|tr|h[1-6]|li)>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+// base64 content for a MIME part, wrapped at 76 chars per RFC 2045.
+function b64Part(s: string): string {
+  return Buffer.from(s, 'utf-8').toString('base64').replace(/(.{76})/g, '$1\r\n');
+}
+
+function b64Buffer(buf: Buffer): string {
+  return buf.toString('base64').replace(/(.{76})/g, '$1\r\n');
+}
+
+/** A file to attach to an outbound email. */
+export interface EmailAttachment {
+  filename: string;
+  contentType: string;
+  content: Buffer;
+}
+
+function sanitizeFilename(name: string): string {
+  return (name || 'attachment').replace(/["\r\n\\]/g, '').trim() || 'attachment';
+}
+
+/**
+ * Build an outbound MIME message. The text+html bodies form a
+ * multipart/alternative entity; when attachments are present the whole thing
+ * is wrapped in multipart/mixed. Everything non-trivial is base64 encoded.
+ */
+/**
+ * Find-or-create the two Gmail labels we use to tag UnieSales traffic inside
+ * the operator's mailbox. Idempotent — listing labels is cheap, creating
+ * happens at most once per account.
+ *
+ *   UnieSales/Sent     — every message UnieSales sends through this account
+ *   UnieSales/Replies  — every inbound reply on a tracked thread (lead reply)
+ *
+ * The combined parent-label naming (`UnieSales/...`) makes Gmail nest them
+ * under a single collapsible "UnieSales" folder in the sidebar. Operator can
+ * one-click "Skip Inbox" via a filter to keep their personal Inbox clean.
+ */
+async function ensureUnieSalesLabels(
+  gmail: ReturnType<typeof google.gmail>,
+): Promise<{ sent: string; replies: string }> {
+  const list = await gmail.users.labels.list({ userId: 'me' });
+  const all = list.data.labels ?? [];
+  const find = (name: string) =>
+    all.find((l) => (l.name ?? '').toLowerCase() === name.toLowerCase())?.id ?? null;
+  let sent = find('UnieSales/Sent');
+  let replies = find('UnieSales/Replies');
+  if (!sent) {
+    const created = await gmail.users.labels.create({
+      userId: 'me',
+      requestBody: {
+        name: 'UnieSales/Sent',
+        labelListVisibility: 'labelShow',
+        messageListVisibility: 'show',
+      },
+    });
+    sent = created.data.id ?? null;
+  }
+  if (!replies) {
+    const created = await gmail.users.labels.create({
+      userId: 'me',
+      requestBody: {
+        name: 'UnieSales/Replies',
+        labelListVisibility: 'labelShow',
+        messageListVisibility: 'show',
+      },
+    });
+    replies = created.data.id ?? null;
+  }
+  if (!sent || !replies) {
+    throw new Error('Failed to resolve UnieSales Gmail labels');
+  }
+  return { sent, replies };
+}
+
+/**
+ * Apply a label to a Gmail message. Best-effort — labelling is a UX nicety;
+ * if Gmail rejects (rate limit, missing scope, transient), the send/sync still
+ * succeeds. Errors get logged at warn level upstream.
+ */
+async function applyLabel(
+  gmail: ReturnType<typeof google.gmail>,
+  messageId: string,
+  labelId: string,
+): Promise<void> {
+  await gmail.users.messages.modify({
+    userId: 'me',
+    id: messageId,
+    requestBody: { addLabelIds: [labelId] },
+  });
+}
+
 function buildRawMimeMessage(input: {
   from: string;
   to: string;
   subject: string;
   body: string;
+  footerHtml?: string | null;
   inReplyToMessageId?: string;
   references?: string;
+  attachments?: EmailAttachment[];
+  /**
+   * Custom RFC 5322 headers — used to stamp every UnieSales outbound message
+   * with X-UnieSales-WorkspaceId / -LeadId / -CampaignId / -Origin so the
+   * operator's Gmail can identify our traffic via filters even if the
+   * UnieSales/Sent label is missing for some reason. Values are inserted
+   * verbatim and must be 7-bit ASCII (UUIDs always are).
+   */
+  customHeaders?: Record<string, string>;
 }): string {
+  const footerHtml = (input.footerHtml ?? '').trim();
+  const footerText = footerHtml ? htmlToPlain(footerHtml) : '';
+
+  const plainBody = footerText ? `${input.body}\n\n${footerText}` : input.body;
+  const htmlBody =
+    '<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#222">' +
+    plainToHtml(input.body) +
+    (footerHtml ? `<br><br>${footerHtml}` : '') +
+    '</div>';
+
+  const altBoundary = `alt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  // A self-contained multipart/alternative entity (its own Content-Type + body).
+  const altEntity =
+    `Content-Type: multipart/alternative; boundary="${altBoundary}"\r\n\r\n` +
+    [
+      `--${altBoundary}`,
+      'Content-Type: text/plain; charset="UTF-8"',
+      'Content-Transfer-Encoding: base64',
+      '',
+      b64Part(plainBody),
+      `--${altBoundary}`,
+      'Content-Type: text/html; charset="UTF-8"',
+      'Content-Transfer-Encoding: base64',
+      '',
+      b64Part(htmlBody),
+      `--${altBoundary}--`,
+    ].join('\r\n');
+
   const headers: string[] = [
-    `From: ${input.from}`,
-    `To: ${input.to}`,
-    `Subject: ${input.subject}`,
+    `From: ${encodeAddressHeader(input.from)}`,
+    `To: ${encodeAddressHeader(input.to)}`,
+    `Subject: ${encodeHeaderWord(input.subject)}`,
     'MIME-Version: 1.0',
-    'Content-Type: text/plain; charset="UTF-8"',
-    'Content-Transfer-Encoding: 7bit',
   ];
   if (input.inReplyToMessageId) headers.push(`In-Reply-To: ${input.inReplyToMessageId}`);
   if (input.references) headers.push(`References: ${input.references}`);
-  const raw = headers.join('\r\n') + '\r\n\r\n' + input.body;
+  if (input.customHeaders) {
+    for (const [k, v] of Object.entries(input.customHeaders)) {
+      // Strip CR/LF defensively so an attacker-controlled value can't inject
+      // additional headers. Our values are UUIDs + safe enums so this is
+      // belt-and-suspenders.
+      const safe = String(v).replace(/[\r\n]+/g, ' ');
+      headers.push(`${k}: ${safe}`);
+    }
+  }
+
+  const attachments = (input.attachments ?? []).filter((a) => a.content.length > 0);
+
+  let raw: string;
+  if (attachments.length === 0) {
+    // No attachments — the message body is the multipart/alternative entity.
+    raw = headers.join('\r\n') + '\r\n' + altEntity;
+  } else {
+    const mixed = `mixed_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+    const parts: string[] = [`--${mixed}`, altEntity];
+    for (const a of attachments) {
+      const fname = sanitizeFilename(a.filename);
+      parts.push(
+        `--${mixed}`,
+        `Content-Type: ${a.contentType}; name="${fname}"`,
+        'Content-Transfer-Encoding: base64',
+        `Content-Disposition: attachment; filename="${fname}"`,
+        '',
+        b64Buffer(a.content),
+      );
+    }
+    parts.push(`--${mixed}--`);
+    raw =
+      headers.join('\r\n') +
+      '\r\n' +
+      `Content-Type: multipart/mixed; boundary="${mixed}"\r\n\r\n` +
+      parts.join('\r\n');
+  }
   return Buffer.from(raw, 'utf-8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Gmail caps at 25MB; stay under.
+
+function guessContentType(name: string, fileType: string | null): string {
+  if (fileType && fileType.includes('/')) return fileType;
+  const ext = (name.toLowerCase().split('.').pop() ?? '').trim();
+  const map: Record<string, string> = {
+    pdf: 'application/pdf',
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    gif: 'image/gif',
+    doc: 'application/msword',
+    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    ppt: 'application/vnd.ms-powerpoint',
+    pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  };
+  return map[ext] ?? 'application/octet-stream';
+}
+
+/**
+ * Resolve campaign knowledge files (chosen by the AI) into email attachments.
+ * Only files explicitly flagged attach_to_emails are eligible — never internal
+ * docs. Silently skips missing objects and anything over the size budget.
+ */
+async function resolveAttachments(workspaceId: string, fileIds: string[]): Promise<EmailAttachment[]> {
+  const ids = [...new Set(fileIds)].filter(Boolean);
+  if (ids.length === 0) return [];
+  const db = getDb();
+  const rows = await db
+    .select()
+    .from(campaignKnowledgeFiles)
+    .where(
+      and(
+        eq(campaignKnowledgeFiles.workspaceId, workspaceId),
+        inArray(campaignKnowledgeFiles.id, ids),
+        eq(campaignKnowledgeFiles.attachToEmails, true),
+        eq(campaignKnowledgeFiles.isActive, true),
+      ),
+    );
+
+  const out: EmailAttachment[] = [];
+  let total = 0;
+  for (const r of rows) {
+    if (!r.s3Url) continue;
+    try {
+      const key = r.s3Url.replace(/^s3:\/\/[^/]+\//, '');
+      const buf = await getObjectBuffer(key);
+      if (total + buf.length > MAX_ATTACHMENT_BYTES) continue;
+      total += buf.length;
+      out.push({
+        filename: r.fileName,
+        contentType: guessContentType(r.fileName, r.fileType),
+        content: buf,
+      });
+    } catch {
+      // missing / unreadable object — skip it rather than fail the whole send
+    }
+  }
+  return out;
+}
+
+/** The workspace's configured HTML footer/signature, or null. */
+async function getWorkspaceFooter(workspaceId: string): Promise<string | null> {
+  const db = getDb();
+  const rows = await db
+    .select({ footer: workspaces.emailFooterHtml })
+    .from(workspaces)
+    .where(eq(workspaces.id, workspaceId))
+    .limit(1);
+  return rows[0]?.footer ?? null;
 }
 
 export interface SendInput {
@@ -203,6 +481,12 @@ export interface SendInput {
   references?: string;
   campaignId?: string;
   leadId?: string;
+  // Warm-up / playground sends bypass the at-risk health gate — low-volume
+  // operator-driven sends are how a domain *rebuilds* reputation. A 'paused'
+  // account is still blocked.
+  bypassHealthGate?: boolean;
+  /** Campaign knowledge file ids to attach (must be flagged attach_to_emails). */
+  attachmentFileIds?: string[];
 }
 
 export interface SendResult {
@@ -213,8 +497,11 @@ export interface SendResult {
 export async function sendEmail(input: SendInput): Promise<SendResult> {
   const account = await getAccount(input.workspaceId, input.gmailAccountId);
   if (!account.isActive) throw new ConflictError('Gmail account is not active');
-  if (account.healthStatus === 'paused' || account.healthStatus === 'at_risk') {
-    throw new ConflictError(`Gmail account health is ${account.healthStatus}`);
+  if (account.healthStatus === 'paused') {
+    throw new ConflictError('Gmail account is paused');
+  }
+  if (account.healthStatus === 'at_risk' && !input.bypassHealthGate) {
+    throw new ConflictError('Gmail account health is at_risk');
   }
   if (account.dailySentCount >= account.dailySendLimit) {
     throw new ConflictError('Daily send limit reached for this Gmail account');
@@ -223,13 +510,27 @@ export async function sendEmail(input: SendInput): Promise<SendResult> {
   const client = await authClientForAccount(account);
   const gmail = google.gmail({ version: 'v1', auth: client });
 
+  const footerHtml = await getWorkspaceFooter(input.workspaceId);
+  const attachments = await resolveAttachments(input.workspaceId, input.attachmentFileIds ?? []);
+  // Stamp every UnieSales-originated message with identifiers Gmail filters
+  // can match on. Operator can then route, label, or skip-inbox without
+  // depending on the UnieSales/Sent label (which can be deleted manually).
+  const customHeaders: Record<string, string> = {
+    'X-UnieSales-Origin': 'send',
+    'X-UnieSales-WorkspaceId': input.workspaceId,
+  };
+  if (input.campaignId) customHeaders['X-UnieSales-CampaignId'] = input.campaignId;
+  if (input.leadId) customHeaders['X-UnieSales-LeadId'] = input.leadId;
   const raw = buildRawMimeMessage({
     from: account.senderName ? `${account.senderName} <${account.email}>` : account.email,
     to: input.to,
     subject: input.subject,
     body: input.body,
+    footerHtml,
     inReplyToMessageId: input.inReplyToMessageId,
     references: input.references,
+    attachments,
+    customHeaders,
   });
 
   const res = await gmail.users.messages.send({
@@ -240,6 +541,18 @@ export async function sendEmail(input: SendInput): Promise<SendResult> {
     },
   });
   if (!res.data.id || !res.data.threadId) throw new Error('Gmail send returned no id/threadId');
+
+  // Tag the just-sent message with UnieSales/Sent so it's visible as a
+  // distinct label in the operator's Gmail sidebar. Best-effort: if labelling
+  // fails the send itself still succeeded and our DB rows are authoritative.
+  try {
+    const labels = await ensureUnieSalesLabels(gmail);
+    await applyLabel(gmail, res.data.id, labels.sent);
+  } catch (err) {
+    // Don't break send for a labelling glitch — log and move on.
+    // eslint-disable-next-line no-console
+    console.warn('[gmail.sendEmail] label apply failed', err);
+  }
 
   // Persist message + thread rows
   const db = getDb();
@@ -312,13 +625,24 @@ export async function createDraft(input: SendInput): Promise<{ draftId: string; 
   const account = await getAccount(input.workspaceId, input.gmailAccountId);
   const client = await authClientForAccount(account);
   const gmail = google.gmail({ version: 'v1', auth: client });
+  const footerHtml = await getWorkspaceFooter(input.workspaceId);
+  // Same stamping as sendEmail so drafts UnieSales creates are identifiable
+  // in the operator's Gmail Drafts folder by header.
+  const customHeaders: Record<string, string> = {
+    'X-UnieSales-Origin': 'draft',
+    'X-UnieSales-WorkspaceId': input.workspaceId,
+  };
+  if (input.campaignId) customHeaders['X-UnieSales-CampaignId'] = input.campaignId;
+  if (input.leadId) customHeaders['X-UnieSales-LeadId'] = input.leadId;
   const raw = buildRawMimeMessage({
     from: account.senderName ? `${account.senderName} <${account.email}>` : account.email,
     to: input.to,
     subject: input.subject,
     body: input.body,
+    footerHtml,
     inReplyToMessageId: input.inReplyToMessageId,
     references: input.references,
+    customHeaders,
   });
   const res = await gmail.users.drafts.create({
     userId: 'me',
@@ -346,11 +670,24 @@ export async function createDraft(input: SendInput): Promise<{ draftId: string; 
 
 // ---- Thread fetch / sync ----
 
+/** Pull every email address out of a header value (handles "Name <a@b.com>, c@d.com"). */
+function extractEmails(headerValue: string | null | undefined): string[] {
+  if (!headerValue) return [];
+  return (headerValue.match(/[\w.+-]+@[\w.-]+\.[\w-]+/g) ?? []).map((e) => e.toLowerCase());
+}
+
+export interface SyncThreadResult {
+  messagesSynced: number;
+  // Set when a NEW inbound message arrived on a campaign-linked thread —
+  // the gmail worker hands this to the reply processor.
+  newInboundReply: { threadId: string; leadId: string; campaignId: string } | null;
+}
+
 export async function syncThread(
   workspaceId: string,
   gmailAccountId: string,
   gmailThreadId: string,
-): Promise<{ messagesSynced: number }> {
+): Promise<SyncThreadResult> {
   const account = await getAccount(workspaceId, gmailAccountId);
   const client = await authClientForAccount(account);
   const gmail = google.gmail({ version: 'v1', auth: client });
@@ -369,11 +706,43 @@ export async function syncThread(
   if (existingThread[0]) {
     threadRow = existingThread[0];
   } else {
+    // Only ingest a NEW thread if one of its participants is a known lead that
+    // belongs to a campaign. The operator's own personal/business mail (bank
+    // alerts, SaaS notifications, etc.) is never pulled into the system.
+    const participants = new Set<string>();
+    for (const m of messages) {
+      const hs = m.payload?.headers ?? [];
+      for (const name of ['From', 'To', 'Cc']) {
+        const v = hs.find((h) => h.name?.toLowerCase() === name.toLowerCase())?.value;
+        for (const e of extractEmails(v)) {
+          if (e !== account.email.toLowerCase()) participants.add(e);
+        }
+      }
+    }
+    if (participants.size === 0) return { messagesSynced: 0, newInboundReply: null };
+
+    const matchedLead = (
+      await db
+        .select({ id: leads.id, campaignId: leads.campaignId })
+        .from(leads)
+        .where(
+          and(
+            eq(leads.workspaceId, workspaceId),
+            isNotNull(leads.campaignId),
+            inArray(leads.email, [...participants]),
+          ),
+        )
+        .limit(1)
+    )[0];
+    if (!matchedLead) return { messagesSynced: 0, newInboundReply: null };
+
     const subjHeader = messages[0]?.payload?.headers?.find((h) => h.name?.toLowerCase() === 'subject')?.value ?? null;
     const inserted = await db
       .insert(emailThreads)
       .values({
         workspaceId,
+        campaignId: matchedLead.campaignId,
+        leadId: matchedLead.id,
         gmailAccountId,
         gmailThreadId,
         subject: subjHeader,
@@ -383,6 +752,11 @@ export async function syncThread(
   }
 
   let synced = 0;
+  let newInbound = false;
+  // Collect Gmail message ids we should label after the loop. Done in a
+  // single batch at the end so we don't trip Gmail's per-call rate limits
+  // when a thread has many new messages at once.
+  const inboundIdsToLabel: string[] = [];
   for (const m of messages) {
     if (!m.id) continue;
     const existing = await db
@@ -398,9 +772,15 @@ export async function syncThread(
     const subject = findHeader('Subject');
     const direction = from?.toLowerCase().includes(account.email.toLowerCase()) ? 'outbound' : 'inbound';
     const body = extractPlainTextBody(m);
+    if (direction === 'inbound') {
+      newInbound = true;
+      inboundIdsToLabel.push(m.id);
+    }
 
     await db.insert(emailMessages).values({
       workspaceId,
+      campaignId: threadRow.campaignId,
+      leadId: threadRow.leadId,
       emailThreadId: threadRow.id,
       gmailMessageId: m.id,
       gmailThreadId,
@@ -413,12 +793,41 @@ export async function syncThread(
     synced++;
   }
 
+  // Tag freshly-ingested inbound messages with UnieSales/Replies so the
+  // operator's Gmail surface mirrors what UnieSales sees as a lead reply.
+  // Best-effort: a label failure doesn't roll back the DB state above.
+  if (inboundIdsToLabel.length > 0) {
+    try {
+      const labels = await ensureUnieSalesLabels(gmail);
+      for (const id of inboundIdsToLabel) {
+        try {
+          await applyLabel(gmail, id, labels.replies);
+        } catch {
+          // Single-message label failure: move on; the message is in our DB.
+        }
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[gmail.syncThread] reply label apply failed', err);
+    }
+  }
+
   await db
     .update(emailThreads)
-    .set({ updatedAt: new Date(), latestGmailMessageId: messages[messages.length - 1]?.id ?? threadRow.latestGmailMessageId })
+    .set({
+      updatedAt: new Date(),
+      latestGmailMessageId: messages[messages.length - 1]?.id ?? threadRow.latestGmailMessageId,
+      ...(newInbound ? { lastInboundAt: new Date() } : {}),
+    })
     .where(eq(emailThreads.id, threadRow.id));
 
-  return { messagesSynced: synced };
+  // A fresh inbound reply on a campaign thread → the worker should process it.
+  const newInboundReply =
+    newInbound && threadRow.leadId && threadRow.campaignId
+      ? { threadId: threadRow.id, leadId: threadRow.leadId, campaignId: threadRow.campaignId }
+      : null;
+
+  return { messagesSynced: synced, newInboundReply };
 }
 
 function extractPlainTextBody(message: {

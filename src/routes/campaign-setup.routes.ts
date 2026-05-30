@@ -39,6 +39,13 @@ const ExitRulesSchema = z.object({
   reactivationAfterDays: z.number().int().min(0).max(3650).optional(),
 });
 
+// Operator-typed revision instructions. 20K matches the training-chat cap so
+// the operator can paste lengthy correction notes (e.g. a whole rewrite of
+// the buyer-persona section) without hitting validation.
+const ReviseSchema = z.object({
+  instructions: z.string().min(1).max(20000),
+});
+
 const PlaybookSchema = z.object({
   campaignThesis: z.string().optional(),
   buyerPersona: z.string().optional(),
@@ -169,6 +176,47 @@ export async function registerCampaignSetupRoutes(app: FastifyInstance): Promise
     return ok({ playbook: await setup.approvePlaybook(req.workspace!.id, campaignId) }, 'Playbook approved');
   });
 
+  // Operator-directed revision. Takes free-text instructions ("make the
+  // buyer persona more specific to 3PLs", "soften the CTA"), passes them
+  // and the CURRENT playbook to the AI, and persists the revised version.
+  // Approving a revised playbook is the same /approve call below.
+  app.post(`${base}/playbook/revise`, { preHandler: WRITE }, async (req) => {
+    const { campaignId } = parseParams(req.params);
+    const input = parseBody(ReviseSchema, req.body);
+    const current = await setup.getPlaybook(req.workspace!.id, campaignId);
+    if (!current) {
+      throw new ValidationError('Generate a playbook before revising it', [
+        { field: 'playbook', reason: 'no playbook exists yet' },
+      ]);
+    }
+    const result = await aiTasks.revisePlaybook({
+      workspaceId: req.workspace!.id,
+      campaignId,
+      // The AI sees the current playbook in human-readable shape — pass the
+      // full DB row so it has all the operator-edited overrides too.
+      currentPlaybook: current as unknown as Record<string, unknown>,
+      instructions: input.instructions,
+    });
+    const persisted = await setup.upsertPlaybook(req.workspace!.id, campaignId, {
+      campaignThesis: result.output.campaign_thesis,
+      buyerPersona: result.output.buyer_persona,
+      targetPains: result.output.target_pains,
+      valueProposition: result.output.value_proposition,
+      primaryHook: result.output.primary_hook,
+      primaryCta: result.output.primary_cta,
+      objectionMap: result.output.objection_map,
+      allowedClaims: result.output.allowed_claims,
+      prohibitedClaims: result.output.prohibited_claims,
+      handoffRules: result.output.handoff_rules,
+      exitRules: result.output.exit_rules,
+      aiOperatingInstructions: result.output.ai_operating_instructions,
+    });
+    return ok(
+      { playbook: persisted, ai: { actionId: result.action.id, confidence: result.confidence } },
+      'Playbook revised',
+    );
+  });
+
   // ---- demo guide ----
   app.get(`${base}/demo-guide`, { preHandler: READ }, async (req) => {
     const { campaignId } = parseParams(req.params);
@@ -198,6 +246,38 @@ export async function registerCampaignSetupRoutes(app: FastifyInstance): Promise
     });
     return ok({ demoGuide: persisted, ai: { actionId: result.action.id, confidence: result.confidence } }, 'Demo guide generated');
   });
+  app.post(`${base}/demo-guide/revise`, { preHandler: WRITE }, async (req) => {
+    const { campaignId } = parseParams(req.params);
+    const input = parseBody(ReviseSchema, req.body);
+    const current = await setup.getDemoGuide(req.workspace!.id, campaignId);
+    if (!current) {
+      throw new ValidationError('Generate a demo guide before revising it', [
+        { field: 'demoGuide', reason: 'no demo guide exists yet' },
+      ]);
+    }
+    const result = await aiTasks.reviseDemoGuide({
+      workspaceId: req.workspace!.id,
+      campaignId,
+      currentDemoGuide: current as unknown as Record<string, unknown>,
+      instructions: input.instructions,
+    });
+    const persisted = await setup.upsertDemoGuide(req.workspace!.id, campaignId, {
+      demoGoal: result.output.demo_goal,
+      preCallConfirmationTemplate: result.output.pre_call_confirmation_template,
+      callAgenda: result.output.call_agenda,
+      discoveryQuestions: result.output.discovery_questions,
+      demoFlow: result.output.demo_flow,
+      qualificationQuestions: result.output.qualification_questions,
+      postCallFollowupTemplate: result.output.post_call_followup_template,
+      proposalRequestChecklist: result.output.proposal_request_checklist,
+      handoffSummaryTemplate: result.output.handoff_summary_template,
+    });
+    return ok(
+      { demoGuide: persisted, ai: { actionId: result.action.id, confidence: result.confidence } },
+      'Demo guide revised',
+    );
+  });
+
   app.post(`${base}/demo-guide/approve`, { preHandler: WRITE }, async (req) => {
     const { campaignId } = parseParams(req.params);
     return ok({ demoGuide: await setup.approveDemoGuide(req.workspace!.id, campaignId) }, 'Demo guide approved');

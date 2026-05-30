@@ -52,5 +52,12 @@ module.exports = {
       env: { NODE_ENV: 'production' },
       ...workerLog('domain-health-worker'),
     },
+    {
+      name: 'lead-source-worker',
+      script: './dist/workers/lead-source.worker.js',
+      instances: 1,
+      env: { NODE_ENV: 'production' },
+      ...workerLog('lead-source-worker'),
+    },
   ],
 };

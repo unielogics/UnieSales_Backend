@@ -9,6 +9,7 @@ import { campaignKnowledgeFiles } from '../db/schema/campaign-knowledge-files';
 import { leads, type Lead } from '../db/schema/leads';
 import { emailThreads, type EmailThread } from '../db/schema/email-threads';
 import { emailMessages, type EmailMessage } from '../db/schema/email-messages';
+import * as salesTraining from './sales-training.service';
 
 export interface AiContextRequest {
   workspaceId: string;
@@ -28,6 +29,13 @@ export interface AiContextPackage {
     industry: string | null;
     auto_reply_confidence_threshold: number;
     auto_reply_enabled: boolean;
+    default_sender_name: string | null;
+    /** Operator's free-text email voice/style instructions. */
+    email_style_guide: string | null;
+    /** Operator-pasted example emails the AI should mimic. */
+    email_samples: Array<{ subject: string; body: string }>;
+    /** True when a footer/signature is configured — the AI must NOT add its own sign-off. */
+    has_footer: boolean;
   };
   campaign: {
     id: string;
@@ -50,10 +58,19 @@ export interface AiContextPackage {
     ai_operating_instructions: string | null;
   } | null;
   knowledge: Array<{ title: string; document_type: string | null; summary: string }>;
+  /**
+   * Marketing files the AI MAY attach to an outbound email (only files the
+   * operator flagged attach_to_emails). The AI picks relevant ones by `id`.
+   */
+  attachments: Array<{ id: string; title: string; document_type: string | null; summary: string }>;
   lead: {
     id: string;
     company_name: string | null;
     contact_name: string | null;
+    /** Split-out first name (from intake or CSV with a single Name field). */
+    first_name: string | null;
+    /** Split-out last name. */
+    last_name: string | null;
     email: string;
     website: string | null;
     title: string | null;
@@ -73,6 +90,13 @@ export interface AiContextPackage {
     status: string;
     personalization: string | null;
     pain_angle: string | null;
+    /**
+     * Operator-defined custom fields imported from a CSV/Sheet column mapping
+     * (e.g. {fleet_size: "200+", wms_in_use: "manual / paper"}). Per-campaign
+     * — keys are not fixed. The AI should treat any value here as high-signal
+     * context and may reference it when scoring or drafting outbound copy.
+     */
+    custom_fields: Record<string, string>;
   } | null;
   thread: {
     subject: string | null;
@@ -92,6 +116,24 @@ export interface AiContextPackage {
       max_days_in_sequence: number | null;
       max_no_reply_followups: number | null;
     } | null;
+  };
+  /**
+   * Per-product training profile. Populated only when the lead is intake-
+   * origin AND a matching `sales_training_profiles` row exists in 'trained'
+   * status (its site/tag match the lead's `custom_fields.site`/`.tag`).
+   *
+   * This is the channel by which Sales-mode training reaches the AI runtime.
+   * Every downstream AI task already JSON-serializes the full context — adding
+   * this key is enough; no per-task prompt rewrites required.
+   */
+  product_training?: {
+    name: string;
+    description: string | null;
+    /** The distilled product memory — encodes FAQs + behavior + knowledge.
+     *  Raw FAQs/knowledge are intentionally NOT included (token cost). */
+    trained_summary: string;
+    behavior: { pricing?: string; demo?: string; followup?: string; handoff?: string };
+    cross_sell: Array<{ slug: string; name: string }>;
   };
 }
 
@@ -168,6 +210,28 @@ export async function buildContext(req: AiContextRequest): Promise<AiContextPack
     }));
   }
 
+  let attachments: AiContextPackage['attachments'] = [];
+  if (campaign) {
+    const aRows = await db
+      .select()
+      .from(campaignKnowledgeFiles)
+      .where(
+        and(
+          eq(campaignKnowledgeFiles.workspaceId, req.workspaceId),
+          eq(campaignKnowledgeFiles.campaignId, campaign.id),
+          eq(campaignKnowledgeFiles.isActive, true),
+          eq(campaignKnowledgeFiles.attachToEmails, true),
+        ),
+      )
+      .limit(20);
+    attachments = aRows.map((k) => ({
+      id: k.id,
+      title: k.fileName,
+      document_type: k.documentType,
+      summary: trim(k.summary ?? k.extractedText, KNOWLEDGE_SUMMARY_MAX_CHARS),
+    }));
+  }
+
   let lead: Lead | null = null;
   if (req.leadId) {
     const rows = await db
@@ -209,6 +273,28 @@ export async function buildContext(req: AiContextRequest): Promise<AiContextPack
     }
   }
 
+  // Sales-mode per-product training. Pull in a matching trained profile when
+  // this is an intake-origin lead. Custom-fields shape is set by the public
+  // intake service (`{ site, tag, page_url, contact, fields, meta, flat }`).
+  let productTraining: AiContextPackage['product_training'] | undefined;
+  if (lead && lead.importOrigin === 'intake' && lead.customFields) {
+    const cf = lead.customFields as Record<string, unknown>;
+    const site = typeof cf.site === 'string' ? cf.site : null;
+    const tag = typeof cf.tag === 'string' ? cf.tag : null;
+    if (site && tag) {
+      const found = await salesTraining.getForRuntime(wsRow.id, site, tag);
+      if (found) {
+        productTraining = {
+          name: found.name,
+          description: found.description,
+          trained_summary: found.trainedSummary,
+          behavior: found.behavior,
+          cross_sell: found.crossSellProfiles.map((x) => ({ slug: x.slug, name: x.name })),
+        };
+      }
+    }
+  }
+
   return {
     workspace: {
       id: wsRow.id,
@@ -218,6 +304,10 @@ export async function buildContext(req: AiContextRequest): Promise<AiContextPack
       industry: wsRow.industry,
       auto_reply_confidence_threshold: Number(wsRow.autoReplyConfidenceThreshold),
       auto_reply_enabled: wsRow.autoReplyEnabled,
+      default_sender_name: wsRow.defaultSenderName,
+      email_style_guide: wsRow.emailStyleGuide ?? null,
+      email_samples: Array.isArray(wsRow.emailSamples) ? wsRow.emailSamples : [],
+      has_footer: !!(wsRow.emailFooterHtml && wsRow.emailFooterHtml.trim()),
     },
     campaign: campaign
       ? {
@@ -244,11 +334,14 @@ export async function buildContext(req: AiContextRequest): Promise<AiContextPack
         }
       : null,
     knowledge,
+    attachments,
     lead: lead
       ? {
           id: lead.id,
           company_name: lead.companyName,
           contact_name: lead.contactName,
+          first_name: lead.firstName,
+          last_name: lead.lastName,
           email: lead.email,
           website: lead.website,
           title: lead.title,
@@ -265,6 +358,12 @@ export async function buildContext(req: AiContextRequest): Promise<AiContextPack
           status: lead.status,
           personalization: lead.personalization,
           pain_angle: lead.painAngle,
+          // JSONB null-coalesce: empty object lets the AI safely iterate keys
+          // even when nothing has been imported into custom_fields.
+          custom_fields:
+            lead.customFields && typeof lead.customFields === 'object'
+              ? (lead.customFields as Record<string, string>)
+              : {},
         }
       : null,
     thread,
@@ -280,5 +379,6 @@ export async function buildContext(req: AiContextRequest): Promise<AiContextPack
           }
         : null,
     },
+    ...(productTraining ? { product_training: productTraining } : {}),
   };
 }

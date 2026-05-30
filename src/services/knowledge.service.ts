@@ -111,7 +111,7 @@ export async function updateMeta(
   workspaceId: string,
   campaignId: string,
   fileId: string,
-  patch: { documentType?: DocumentType; isActive?: boolean; summary?: string },
+  patch: { documentType?: DocumentType; isActive?: boolean; summary?: string; attachToEmails?: boolean },
 ): Promise<CampaignKnowledgeFile> {
   await getById(workspaceId, campaignId, fileId);
   const db = getDb();

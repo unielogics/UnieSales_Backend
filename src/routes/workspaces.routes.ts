@@ -14,23 +14,56 @@ const HandoffRuleSchema = z.object({
   tone: z.enum(['info', 'warning', 'danger']).optional(),
 });
 
+// Optional string fields are .nullable() too — the Settings form sends `null`
+// (not `undefined`) for fields the operator left blank.
 const CreateSchema = z.object({
   name: z.string().min(1).max(120),
   companyName: z.string().min(1).max(200),
-  brandName: z.string().max(120).optional(),
-  industry: z.string().max(120).optional(),
-  website: z.string().url().optional(),
-  defaultFromEmail: z.string().email().optional(),
-  defaultSenderName: z.string().max(120).optional(),
-  defaultBookingLink: z.string().url().optional(),
-  notificationEmail: z.string().email().optional(),
+  brandName: z.string().max(120).nullable().optional(),
+  industry: z.string().max(120).nullable().optional(),
+  website: z.string().url().nullable().optional(),
+  defaultFromEmail: z.string().email().nullable().optional(),
+  defaultSenderName: z.string().max(120).nullable().optional(),
+  defaultBookingLink: z.string().url().nullable().optional(),
+  notificationEmail: z.string().email().nullable().optional(),
   autoReplyEnabled: z.boolean().optional(),
-  autoReplyConfidenceThreshold: z.number().min(0).max(1).optional(),
+  autoReplyConfidenceThreshold: z.coerce.number().min(0).max(1).optional(),
+});
+
+const EmailSampleSchema = z.object({
+  subject: z.string().max(300),
+  body: z.string().max(10000),
+});
+
+const HHMM = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'expected HH:MM');
+
+const BlockedWindowSchema = z.object({
+  id: z.string().min(1).max(64),
+  label: z.string().max(120),
+  days: z.array(z.number().int().min(0).max(6)).max(7),
+  start: HHMM,
+  end: HHMM,
+});
+
+const CalendarConfigSchema = z.object({
+  timezone: z.string().min(1).max(64),
+  workingDays: z.array(z.number().int().min(0).max(6)).max(7),
+  workingHours: z.object({ start: HHMM, end: HHMM }),
+  meetingDurationMinutes: z.number().int().min(5).max(480),
+  slotIntervalMinutes: z.number().int().min(5).max(240),
+  minLeadTimeHours: z.number().int().min(0).max(720),
+  slotsNextDay: z.number().int().min(0).max(10),
+  slotsDayAfter: z.number().int().min(0).max(10),
+  blockedWindows: z.array(BlockedWindowSchema).max(50),
 });
 
 const UpdateSchema = CreateSchema.partial().extend({
   isActive: z.boolean().optional(),
   handoffRules: z.array(HandoffRuleSchema).max(100).optional(),
+  emailFooterHtml: z.string().max(50000).nullable().optional(),
+  emailStyleGuide: z.string().max(8000).nullable().optional(),
+  emailSamples: z.array(EmailSampleSchema).max(10).nullable().optional(),
+  calendarConfig: CalendarConfigSchema.nullable().optional(),
 });
 
 function parse<T extends z.ZodTypeAny>(schema: T, body: unknown): z.infer<T> {

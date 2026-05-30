@@ -95,9 +95,14 @@ export interface DashboardSummary {
     leads: { total: number; active: number; closed: number };
     gmail_accounts: number;
     pending_ai_actions: number;
+    /** Leads with a scheduled send the followup worker will fire. */
+    scheduled_sends: number;
     send_volume_7d: number;
+    send_volume_today: number;
     handoff_queue: number;
     replied_7d: number;
+    /** Leads created today, split by how they entered. */
+    new_leads_today: { from_upload: number; from_update: number };
   };
 }
 
@@ -107,6 +112,11 @@ export async function dashboard(workspaceId: string): Promise<DashboardSummary> 
 
   const ws = await getById(workspaceId);
   if (!ws) throw new NotFoundError('Workspace not found');
+
+  // "Today" follows the operator's calendar timezone, not UTC — so the
+  // dashboard's daily numbers roll over at the operator's midnight.
+  const tz = ws.calendarConfig?.timezone ?? 'America/New_York';
+  const dayStart = sql`date_trunc('day', now() AT TIME ZONE ${tz}) AT TIME ZONE ${tz}`;
 
   const [campaignsStats] = await db
     .select({
@@ -131,10 +141,35 @@ export async function dashboard(workspaceId: string): Promise<DashboardSummary> 
     .from(gmailAccounts)
     .where(eq(gmailAccounts.workspaceId, workspaceId));
 
+  // Campaigns Overview is the Campaigns-mode landing — restrict "things to do"
+  // counts to outbound-origin leads only. Intake-origin (Sales) leads surface
+  // in the Sales Cockpit / Inbound Leads / Sales Tasks instead.
+  const outboundLeadIds = db
+    .select({ id: leads.id })
+    .from(leads)
+    .where(
+      sql`workspace_id = ${workspaceId} AND (import_origin IS NULL OR import_origin <> 'intake')`,
+    );
+
   const [aiPending] = await db
     .select({ n: sql<number>`count(*)::int` })
     .from(aiActions)
-    .where(and(eq(aiActions.workspaceId, workspaceId), inArray(aiActions.status, ['pending', 'processing'])));
+    .where(
+      and(
+        eq(aiActions.workspaceId, workspaceId),
+        inArray(aiActions.status, ['pending', 'processing']),
+        // Either no linked lead OR the linked lead is outbound.
+        sql`(${aiActions.leadId} IS NULL OR ${aiActions.leadId} IN ${outboundLeadIds})`,
+      ),
+    );
+
+  // Leads with a scheduled send queued for the followup worker. Outbound only.
+  const [scheduledSends] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(leads)
+    .where(
+      sql`workspace_id = ${workspaceId} AND lifecycle_status = 'active' AND ai_owner = true AND next_action_at IS NOT NULL AND (import_origin IS NULL OR import_origin <> 'intake')`,
+    );
 
   // Send volume in last 7 days + handoff queue depth + recent thread activity
   const [sendVolume] = await db
@@ -143,14 +178,42 @@ export async function dashboard(workspaceId: string): Promise<DashboardSummary> 
     .where(
       sql`workspace_id = ${workspaceId} AND direction = 'outbound' AND created_at >= NOW() - INTERVAL '7 days'`,
     );
+  const [sendVolumeToday] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(sql`email_messages`)
+    .where(
+      sql`workspace_id = ${workspaceId} AND direction = 'outbound' AND created_at >= ${dayStart}`,
+    );
+  // Handoff queue — outbound only on the Campaigns Overview.
   const [handoffQueue] = await db
     .select({ n: sql<number>`count(*)::int` })
     .from(leads)
-    .where(and(eq(leads.workspaceId, workspaceId), eq(leads.status, 'handoff_required')));
+    .where(
+      and(
+        eq(leads.workspaceId, workspaceId),
+        eq(leads.status, 'handoff_required'),
+        sql`(${leads.importOrigin} IS NULL OR ${leads.importOrigin} <> 'intake')`,
+      ),
+    );
+  // Real replies: distinct outbound leads that sent an inbound message in the
+  // last 7 days. (Lead status alone undercounts — the reply pipeline
+  // immediately advances a replied lead to objection / interested /
+  // meeting_requested.)
   const [repliedThisWeek] = await db
-    .select({ n: sql<number>`count(*)::int` })
+    .select({ n: sql<number>`count(distinct em.lead_id)::int` })
+    .from(sql`email_messages em JOIN leads l ON l.id = em.lead_id`)
+    .where(
+      sql`em.workspace_id = ${workspaceId} AND em.direction = 'inbound' AND em.lead_id IS NOT NULL AND em.created_at >= NOW() - INTERVAL '7 days' AND (l.import_origin IS NULL OR l.import_origin <> 'intake')`,
+    );
+
+  // New leads created today, split by how they entered (upload vs refresh).
+  const [newLeadsToday] = await db
+    .select({
+      from_upload: sql<number>`sum(case when ${leads.importOrigin} = 'upload' then 1 else 0 end)::int`,
+      from_update: sql<number>`sum(case when ${leads.importOrigin} = 'update' then 1 else 0 end)::int`,
+    })
     .from(leads)
-    .where(sql`workspace_id = ${workspaceId} AND status = 'replied' AND updated_at >= NOW() - INTERVAL '7 days'`);
+    .where(sql`workspace_id = ${workspaceId} AND created_at >= ${dayStart}`);
 
   return {
     workspace: ws,
@@ -167,9 +230,15 @@ export async function dashboard(workspaceId: string): Promise<DashboardSummary> 
       },
       gmail_accounts: gmailCount?.n ?? 0,
       pending_ai_actions: aiPending?.n ?? 0,
+      scheduled_sends: scheduledSends?.n ?? 0,
       send_volume_7d: sendVolume?.n ?? 0,
+      send_volume_today: sendVolumeToday?.n ?? 0,
       handoff_queue: handoffQueue?.n ?? 0,
       replied_7d: repliedThisWeek?.n ?? 0,
+      new_leads_today: {
+        from_upload: newLeadsToday?.from_upload ?? 0,
+        from_update: newLeadsToday?.from_update ?? 0,
+      },
     },
   };
 }

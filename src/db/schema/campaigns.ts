@@ -15,6 +15,9 @@ export const campaigns = pgTable(
     campaignType: text('campaign_type'),
 
     status: text('status').notNull().default('draft'),
+    // When true the campaign is live but still in operator-driven warm-up
+    // (manual sends only). Cleared by an explicit "Activate Campaign".
+    warmupMode: boolean('warmup_mode').notNull().default(false),
 
     targetAudience: text('target_audience'),
     offer: text('offer'),
@@ -30,6 +33,14 @@ export const campaigns = pgTable(
     maxFollowups: integer('max_followups').notNull().default(4),
     followupSchedule: jsonb('followup_schedule'),
 
+    // SMS-specific config. Default null → behaves as channel_mode='auto',
+    // quiet hours 20:00–09:00 in the workspace timezone.
+    smsConfig: jsonb('sms_config').$type<{
+      channelMode?: 'auto' | 'email_only' | 'sms_only';
+      quietHoursStart?: string; // "HH:MM" in workspace tz
+      quietHoursEnd?: string; // "HH:MM" in workspace tz
+    }>(),
+
     dailySendLimit: integer('daily_send_limit').notNull().default(25),
     // 24-hour clock HH:MM strings — backend validator enforces format
     sendWindowStart: text('send_window_start').notNull().default('09:00'),
@@ -42,6 +53,11 @@ export const campaigns = pgTable(
     // Set by the Test step's /test endpoint. Drives the "Test reviewed" check
     // in the launch checklist and the Test builder step's done state.
     lastTestedAt: timestamp('last_tested_at', { withTimezone: false }),
+
+    // Configured at Step 11. When set + in the future, the campaign is queued
+    // to auto-activate at that instant (the followup worker runs the same
+    // activation gate at the scheduled time). Cleared once activation fires.
+    scheduledStartAt: timestamp('scheduled_start_at', { withTimezone: false }),
 
     createdAt: timestamp('created_at', { withTimezone: false }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: false }).notNull().defaultNow(),

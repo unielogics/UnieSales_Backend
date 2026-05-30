@@ -22,6 +22,10 @@ export const campaignKnowledgeFiles = pgTable(
     documentType: text('document_type'),
     extractionStatus: text('extraction_status').notNull().default('pending'),
 
+    // When true, the AI may attach this file to outbound emails (marketing
+    // PDFs, app one-pagers, etc). The AI decides per email whether it's relevant.
+    attachToEmails: boolean('attach_to_emails').notNull().default(false),
+
     isActive: boolean('is_active').notNull().default(true),
 
     createdAt: timestamp('created_at', { withTimezone: false }).notNull().defaultNow(),

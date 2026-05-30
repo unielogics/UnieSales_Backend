@@ -22,6 +22,15 @@ export const campaignLeadSources = pgTable(
     importFrequency: text('import_frequency').notNull().default('manual'),
     lastImportedAt: timestamp('last_imported_at', { withTimezone: false }),
     importStatus: text('import_status').notNull().default('pending'),
+    // Outcome of the most recent import: { created, skipped_existing,
+    // skipped_invalid, total_rows } — surfaced in the Lead Source UI.
+    lastImportResult: jsonb('last_import_result').$type<{
+      created: number;
+      skipped_existing: number;
+      skipped_invalid: number;
+      skipped_suppressed?: number;
+      total_rows: number;
+    }>(),
 
     isActive: boolean('is_active').notNull().default(true),
 

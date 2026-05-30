@@ -18,6 +18,10 @@ const GoogleSheetSchema = z.object({
 });
 const ManualSchema = z.object({ sourceName: z.string().max(200).optional() });
 const MapColumnsSchema = z.object({ fieldMapping: z.record(z.string(), z.string()) });
+const UpdateSourceSchema = z.object({
+  importFrequency: z.enum(ls.IMPORT_FREQUENCIES).optional(),
+  isActive: z.boolean().optional(),
+});
 
 function parseBody<T extends z.ZodTypeAny>(s: T, body: unknown): z.infer<T> {
   const r = s.safeParse(body);
@@ -101,6 +105,15 @@ export async function registerLeadSourceRoutes(app: FastifyInstance): Promise<vo
   app.get(`${base}/:sourceId/preview`, { preHandler: READ }, async (req) => {
     const { campaignId, sourceId } = parsePath(SourcePathSchema, req.params);
     return ok(await ls.preview(req.workspace!.id, campaignId, sourceId));
+  });
+
+  app.patch(`${base}/:sourceId`, { preHandler: WRITE }, async (req) => {
+    const { campaignId, sourceId } = parsePath(SourcePathSchema, req.params);
+    const input = parseBody(UpdateSourceSchema, req.body ?? {});
+    return ok(
+      { source: await ls.update(req.workspace!.id, campaignId, sourceId, input) },
+      'Lead source updated',
+    );
   });
 
   app.post(`${base}/:sourceId/import`, { preHandler: WRITE }, async (req) => {

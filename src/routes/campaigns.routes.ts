@@ -25,9 +25,22 @@ const CreateSchema = z.object({
   weekdaysOnly: z.boolean().optional(),
   handoffEmail: z.string().email().nullable().optional(),
   gmailAccountId: z.string().uuid().optional(),
+  smsConfig: z
+    .object({
+      channelMode: z.enum(['auto', 'email_only', 'sms_only']).optional(),
+      quietHoursStart: z.string().regex(/^[0-2]\d:[0-5]\d$/, 'HH:MM 24h').optional(),
+      quietHoursEnd: z.string().regex(/^[0-2]\d:[0-5]\d$/, 'HH:MM 24h').optional(),
+    })
+    .nullable()
+    .optional(),
 });
 
-const UpdateSchema = CreateSchema.partial();
+// scheduledStartAt is update-only — it's coerced from ISO string → Date in
+// the PATCH handler. Adding it to CreateSchema would let new campaigns ship
+// with a string where a Date is expected.
+const UpdateSchema = CreateSchema.partial().extend({
+  scheduledStartAt: z.string().nullable().optional(),
+});
 
 const CampaignParamsSchema = z.object({
   workspaceId: z.string().uuid(),
@@ -87,7 +100,18 @@ export async function registerCampaignRoutes(app: FastifyInstance): Promise<void
     { preHandler: ADMIN_SCOPED_PREHANDLERS },
     async (req) => {
       const { campaignId } = parseCampaignParams(req.params);
-      const patch = parseBody(UpdateSchema, req.body);
+      const raw = parseBody(UpdateSchema, req.body);
+      // Coerce scheduledStartAt from ISO string → Date (null is preserved).
+      const patch: Record<string, unknown> = { ...raw };
+      if (typeof raw.scheduledStartAt === 'string') {
+        const d = new Date(raw.scheduledStartAt);
+        if (Number.isNaN(d.getTime())) {
+          throw new ValidationError('Invalid scheduledStartAt', [
+            { field: 'scheduledStartAt', reason: 'must be an ISO 8601 datetime' },
+          ]);
+        }
+        patch.scheduledStartAt = d;
+      }
       const campaign = await campaignService.update(req.workspace!.id, campaignId, patch);
       return ok({ campaign }, 'Updated');
     },
@@ -132,6 +156,84 @@ export async function registerCampaignRoutes(app: FastifyInstance): Promise<void
       const { runTest } = await import('../services/campaign-test.service');
       const r = await runTest({ workspaceId: req.workspace!.id, campaignId });
       return ok(r);
+    },
+  );
+
+  // --- Step 11: Send test emails & Activate (Playground) ---
+  //
+  // Test sends are isolated: they create / reuse a lead with
+  // source='playground_test', send through the full AI pipeline, and never
+  // mutate campaign status. Activation is the separate POST /activate route
+  // and remains the only path that flips a campaign to live sending.
+
+  const PlaygroundSendSchema = z.object({
+    // Required recipient address for this test send. Renamed in the request
+    // body to make intent obvious; mapped to the service's `email` field.
+    recipientEmail: z.string().email(),
+    contactName: z.string().max(200).optional(),
+    companyName: z.string().max(200).optional(),
+    title: z.string().max(200).optional(),
+    sourceNotes: z.string().max(2000).optional(),
+    gmailAccountId: z.string().uuid().optional(),
+    subjectOverride: z.string().max(200).optional(),
+    bodyOverride: z.string().max(5000).optional(),
+  });
+
+  app.post(
+    '/api/workspaces/:workspaceId/campaigns/:campaignId/playground/send',
+    { preHandler: ADMIN_SCOPED_PREHANDLERS },
+    async (req) => {
+      const { campaignId } = parseCampaignParams(req.params);
+      const { recipientEmail, ...rest } = parseBody(PlaygroundSendSchema, req.body);
+      const { runPlaygroundSend } = await import('../services/campaign-playground.service');
+      const r = await runPlaygroundSend({
+        workspaceId: req.workspace!.id,
+        campaignId,
+        email: recipientEmail,
+        ...rest,
+      });
+      return ok(r, 'Test email sent');
+    },
+  );
+
+  app.get(
+    '/api/workspaces/:workspaceId/campaigns/:campaignId/playground/leads',
+    { preHandler: SCOPED_PREHANDLERS },
+    async (req) => {
+      const { campaignId } = parseCampaignParams(req.params);
+      const { listPlaygroundLeads, getPrereqStatus } = await import('../services/campaign-playground.service');
+      const [leads, prereq] = await Promise.all([
+        listPlaygroundLeads(req.workspace!.id, campaignId),
+        getPrereqStatus(req.workspace!.id, campaignId),
+      ]);
+      return ok({ leads, prereq });
+    },
+  );
+
+  // Wipe a warm-up lead's prior email + re-send (re-trigger the AI).
+  const PlaygroundLeadParams = z.object({
+    workspaceId: z.string().uuid(),
+    campaignId: z.string().uuid(),
+    leadId: z.string().uuid(),
+  });
+  app.post(
+    '/api/workspaces/:workspaceId/campaigns/:campaignId/playground/leads/:leadId/restart',
+    { preHandler: ADMIN_SCOPED_PREHANDLERS },
+    async (req) => {
+      const r = PlaygroundLeadParams.safeParse(req.params);
+      if (!r.success) {
+        throw new ValidationError(
+          'Invalid path',
+          r.error.issues.map((i) => ({ field: i.path.join('.'), reason: i.message })),
+        );
+      }
+      const { restartPlaygroundSend } = await import('../services/campaign-playground.service');
+      const result = await restartPlaygroundSend({
+        workspaceId: req.workspace!.id,
+        campaignId: r.data.campaignId,
+        leadId: r.data.leadId,
+      });
+      return ok(result, 'Warm-up restarted');
     },
   );
 }

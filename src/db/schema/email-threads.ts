@@ -13,12 +13,22 @@ export const emailThreads = pgTable(
     leadId: uuid('lead_id').references(() => leads.id),
     gmailAccountId: uuid('gmail_account_id').references(() => gmailAccounts.id),
 
-    gmailThreadId: text('gmail_thread_id').notNull(),
+    // Email threads carry Gmail's thread id; SMS conversations don't have one.
+    gmailThreadId: text('gmail_thread_id'),
     latestGmailMessageId: text('latest_gmail_message_id'),
     subject: text('subject'),
 
+    // 'email' (default) or 'sms'. SMS threads have one row per lead.
+    channel: text('channel').notNull().default('email'),
+
     status: text('status').notNull().default('active'),
     aiOwner: boolean('ai_owner').notNull().default(true),
+
+    // Operator-controlled soft-drop. When set, the thread disappears from
+    // the Inbox view. The Gmail message + lead row are untouched — this is
+    // purely a UnieSales-side dismissal. Cleared if the operator restores
+    // (no UI for that yet; backend supports it).
+    dismissedAt: timestamp('dismissed_at', { withTimezone: true }),
 
     lastInboundAt: timestamp('last_inbound_at', { withTimezone: false }),
     lastOutboundAt: timestamp('last_outbound_at', { withTimezone: false }),

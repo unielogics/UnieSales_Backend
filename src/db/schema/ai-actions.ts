@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, numeric, jsonb, timestamp, index } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, text, numeric, jsonb, timestamp, integer, index } from 'drizzle-orm/pg-core';
 import { workspaces } from './workspaces';
 import { campaigns } from './campaigns';
 import { leads } from './leads';
@@ -21,6 +21,14 @@ export const aiActions = pgTable(
     confidence: numeric('confidence', { precision: 4, scale: 3 }),
     reason: text('reason'),
     aiOutput: jsonb('ai_output'),
+
+    // Anthropic token accounting (from response.usage) — lets us measure
+    // per-task spend and prompt-cache hit rate. Nullable: legacy rows + tasks
+    // that don't go through runAction won't have these.
+    inputTokens: integer('input_tokens'),
+    outputTokens: integer('output_tokens'),
+    cacheReadTokens: integer('cache_read_tokens'),
+    cacheCreationTokens: integer('cache_creation_tokens'),
 
     createdAt: timestamp('created_at', { withTimezone: false }).notNull().defaultNow(),
     completedAt: timestamp('completed_at', { withTimezone: false }),
@@ -48,9 +56,21 @@ export const AI_ACTION_TYPES = [
   'pause_lead',
   'generate_playbook',
   'generate_demo_guide',
+  // Operator-directed revisions of an existing playbook / demo guide.
+  // Same output shape as the generate_* tasks, different prompt: apply
+  // instructions surgically rather than synthesize from scratch.
+  'revise_playbook',
+  'revise_demo_guide',
   'summarize_thread',
   'extract_knowledge',
   'summarize_knowledge',
+  // Lead triage — temperature + intent labels. Used by the post-intake runner
+  // to decide downstream actions (booking, info request, handoff, etc.).
+  'classify_lead',
+  // Catch-all wrapper for one full post-intake runner pass; lets us attribute
+  // cost + audit one row per lead even when the runner fans out to multiple
+  // sub-tasks. Score / classify / etc. still get their own rows too.
+  'intake_post_process',
 ] as const;
 export type AiActionType = (typeof AI_ACTION_TYPES)[number];
 

@@ -13,6 +13,36 @@ export type HandoffRule = {
   tone?: 'info' | 'warning' | 'danger';
 };
 
+// A sample email the operator pasted in — the AI mimics this voice.
+export type EmailSample = {
+  subject: string;
+  body: string;
+};
+
+// A recurring window the operator is NOT available — the slot engine never
+// offers a meeting time that overlaps one of these.
+export type BlockedWindow = {
+  id: string;
+  label: string;
+  days: number[]; // 0=Sun .. 6=Sat
+  start: string; // "HH:MM" 24h, in the config timezone
+  end: string; // "HH:MM" 24h, in the config timezone
+};
+
+// Per-workspace scheduling config. Drives the AI's meeting proposals: which
+// open slots to offer a lead, working hours, call length, and blocked time.
+export type CalendarConfig = {
+  timezone: string; // IANA tz, e.g. "America/New_York"
+  workingDays: number[]; // 0=Sun .. 6=Sat
+  workingHours: { start: string; end: string }; // "HH:MM"
+  meetingDurationMinutes: number;
+  slotIntervalMinutes: number; // granularity of candidate start times
+  minLeadTimeHours: number; // never offer a slot sooner than this
+  slotsNextDay: number; // slots offered on the next working day
+  slotsDayAfter: number; // slots offered on the working day after
+  blockedWindows: BlockedWindow[];
+};
+
 export const workspaces = pgTable(
   'workspaces',
   {
@@ -38,6 +68,18 @@ export const workspaces = pgTable(
     }).notNull().default('0.850'),
 
     handoffRules: jsonb('handoff_rules').$type<HandoffRule[]>().notNull().default([]),
+
+    // Outbound email config (per workspace).
+    // HTML footer/signature appended to every sent email.
+    emailFooterHtml: text('email_footer_html'),
+    // Free-text voice/style instructions fed to the email-writing AI.
+    emailStyleGuide: text('email_style_guide'),
+    // Operator-pasted example emails — few-shot voice samples for the AI.
+    emailSamples: jsonb('email_samples').$type<EmailSample[]>(),
+
+    // Scheduling config (working hours, call length, blocked time). Null →
+    // the service falls back to DEFAULT_CALENDAR_CONFIG.
+    calendarConfig: jsonb('calendar_config').$type<CalendarConfig>(),
 
     isActive: boolean('is_active').notNull().default(true),
 

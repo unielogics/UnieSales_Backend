@@ -16,6 +16,11 @@ export const emailMessages = pgTable(
 
     gmailMessageId: text('gmail_message_id'),
     gmailThreadId: text('gmail_thread_id'),
+    /** Twilio MessageSid for SMS messages; null for email. */
+    twilioMessageSid: text('twilio_message_sid'),
+
+    /** 'email' (default) or 'sms'. */
+    channel: text('channel').notNull().default('email'),
 
     direction: text('direction'),
 

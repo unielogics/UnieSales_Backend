@@ -6,7 +6,11 @@ import { ok } from '../services/response.service';
 import { ValidationError } from '../utils/errors';
 import * as leadService from '../services/lead.service';
 import * as suppressionService from '../services/suppression.service';
+import * as threadService from '../services/thread.service';
 import * as aiTasks from '../services/ai-tasks.service';
+import * as gmailService from '../services/gmail.service';
+import * as bookingPageService from '../services/booking-page.service';
+import { sendSmsToLead } from '../services/sms.service';
 import { ConflictError } from '../utils/errors';
 import { LEAD_STATUSES, type LeadStatus } from '../db/schema/leads';
 
@@ -22,6 +26,9 @@ const ListQuery = z.object({
   offset: z.coerce.number().int().nonnegative().optional(),
   orderBy: z.enum(['created_at', 'updated_at', 'last_engagement_at', 'lead_score']).optional(),
   orderDir: z.enum(['asc', 'desc']).optional(),
+  // Sales-vs-Campaigns mode isolation. `intake` = inbound public-form leads
+  // only; `outbound` = CSV/Sheet/manual leads only; omitted = everything.
+  origin: z.enum(['intake', 'outbound']).optional(),
 });
 
 const CreateSchema = z.object({
@@ -53,7 +60,13 @@ const UpdateSchema = z.object({
   leadScoreReason: z.string().max(2000).optional(),
   painAngle: z.string().max(2000).optional(),
   personalization: z.string().max(4000).optional(),
+  sourceNotes: z.string().max(8000).nullable().optional(),
   aiOwner: z.boolean().optional(),
+  // Sales-mode pipeline stage. Free-form string so adding new stages later
+  // doesn't require a migration. The frontend Pipeline view consumes a fixed
+  // list (new_inbound, ai_reviewed, ai_contacting, replied, booking_link_sent,
+  // booked, opportunity, won, lost, nurture_later).
+  pipelineStage: z.string().max(50).nullable().optional(),
 });
 
 const BulkSchema = z.object({
@@ -120,12 +133,12 @@ export async function registerLeadRoutes(app: FastifyInstance): Promise<void> {
 
   app.get(base, { preHandler: READ }, async (req) => {
     const q = parseQuery(ListQuery, req.query);
-    return ok(
-      await leadService.list(req.workspace!.id, {
-        ...q,
-        status: parseStatusFilter(q.status),
-      }),
-    );
+    const r = await leadService.list(req.workspace!.id, {
+      ...q,
+      status: parseStatusFilter(q.status),
+    });
+    // Frontend expects `leads`; service returns `items` — map it here.
+    return ok({ leads: r.items, total: r.total, limit: r.limit, offset: r.offset });
   });
 
   app.post(base, { preHandler: WRITE }, async (req, reply) => {
@@ -147,9 +160,57 @@ export async function registerLeadRoutes(app: FastifyInstance): Promise<void> {
     return ok(r, `${r.updated} leads updated`);
   });
 
+  // Soft-delete a batch of leads. Sets deleted_at + flips aiOwner off so
+  // every UI surface and every worker stops touching them. Idempotent.
+  app.post(`${base}/bulk-delete`, { preHandler: WRITE }, async (req) => {
+    const input = parseBody(
+      z.object({ leadIds: z.array(z.string().uuid()).min(1).max(500) }),
+      req.body,
+    );
+    const r = await leadService.bulkSoftDelete(req.workspace!.id, input.leadIds);
+    return ok(r, `${r.deleted} leads deleted`);
+  });
+
+  // Cancel a batch of scheduled outbound sends. Backs the AI Queue's
+  // "Scheduled to send" delete affordance — clears next_action_at so the
+  // followup worker stops picking these leads up. Lead survives.
+  app.post(`${base}/bulk-cancel-scheduled`, { preHandler: WRITE }, async (req) => {
+    const input = parseBody(
+      z.object({ leadIds: z.array(z.string().uuid()).min(1).max(500) }),
+      req.body,
+    );
+    const r = await leadService.bulkCancelScheduled(req.workspace!.id, input.leadIds);
+    return ok(r, `${r.cancelled} sends cancelled`);
+  });
+
+  // Restore previously soft-deleted leads. No UI hook yet; here for recovery
+  // via curl if the operator deletes by mistake.
+  app.post(`${base}/bulk-restore`, { preHandler: WRITE }, async (req) => {
+    const input = parseBody(
+      z.object({ leadIds: z.array(z.string().uuid()).min(1).max(500) }),
+      req.body,
+    );
+    const r = await leadService.bulkRestore(req.workspace!.id, input.leadIds);
+    return ok(r, `${r.restored} leads restored`);
+  });
+
   app.get(`${base}/:leadId`, { preHandler: READ }, async (req) => {
     const { leadId } = parsePath(LeadPath, req.params);
     return ok({ lead: await leadService.getById(req.workspace!.id, leadId) });
+  });
+
+  // Email conversation history for the lead modal's Thread tab.
+  app.get(`${base}/:leadId/threads`, { preHandler: READ }, async (req) => {
+    const { leadId } = parsePath(LeadPath, req.params);
+    const threads = await threadService.listByLead(req.workspace!.id, leadId);
+    return ok({ threads });
+  });
+
+  // Full activity timeline for the lead modal's Activity tab.
+  app.get(`${base}/:leadId/activity`, { preHandler: READ }, async (req) => {
+    const { leadId } = parsePath(LeadPath, req.params);
+    const events = await leadService.getActivity(req.workspace!.id, leadId);
+    return ok({ events });
   });
 
   app.patch(`${base}/:leadId`, { preHandler: WRITE }, async (req) => {
@@ -244,6 +305,81 @@ export async function registerLeadRoutes(app: FastifyInstance): Promise<void> {
   // Send-next is wired up in Phase 11 (workers); the route stays so the UI knows it exists.
   app.post(`${base}/:leadId/send-next`, { preHandler: WRITE }, async () => {
     return ok({ sent: false }, 'Use /api/workspaces/:wid/gmail/send for now; sequencer lands in Phase 11');
+  });
+
+  // Inline composer on the LeadDetail center column. If the lead has an
+  // existing email thread, this is identical to /threads/:id/send-reply (uses
+  // that thread's gmail account + thread id for Gmail-side stitching).
+  // Otherwise we send a fresh email from the workspace's first active gmail
+  // account — Gmail creates the thread, we link it to this lead via leadId.
+  const SendLeadReplySchema = z.object({
+    subject: z.string().max(500).optional(),
+    body: z.string().min(1).max(20000),
+  });
+  app.post(`${base}/:leadId/send-reply`, { preHandler: WRITE }, async (req) => {
+    const { leadId } = parsePath(LeadPath, req.params);
+    const input = parseBody(SendLeadReplySchema, req.body);
+    const lead = await leadService.getById(req.workspace!.id, leadId);
+
+    // Prefer the lead's most recent thread (any direction). That gives us the
+    // gmail account + Gmail thread id so the reply stitches into the existing
+    // conversation properly.
+    const threads = await threadService.listByLead(req.workspace!.id, leadId);
+    const existing = threads[0] ?? null;
+
+    // SMS path stays out of the inline composer for now — operators send SMS
+    // from the Inbox where the thread UI is full-screen.
+    if (existing && existing.channel === 'sms') {
+      const r = await sendSmsToLead({
+        workspaceId: req.workspace!.id,
+        leadId,
+        body: input.body,
+      });
+      return ok({ kind: 'sms', messageId: r.messageId }, 'SMS sent');
+    }
+
+    let gmailAccountId: string | null = existing?.gmailAccountId ?? null;
+    if (!gmailAccountId) {
+      // Fresh outbound — fall back to the workspace's first active gmail account.
+      const accounts = await gmailService.listAccounts(req.workspace!.id);
+      const usable = accounts.find((a) => a.isActive && a.healthStatus !== 'paused');
+      if (!usable) {
+        throw new ConflictError(
+          'No active Gmail account on this workspace — connect one in Settings.',
+          [{ field: 'gmail', reason: 'no_active_account' }],
+        );
+      }
+      gmailAccountId = usable.id;
+    }
+
+    const subjectLine =
+      input.subject ??
+      (existing?.subject ? `Re: ${existing.subject}` : `Hello ${lead.contactName ?? ''}`.trim());
+
+    const r = await gmailService.sendEmail({
+      workspaceId: req.workspace!.id,
+      gmailAccountId,
+      to: lead.email,
+      subject: subjectLine,
+      body: input.body,
+      threadId: existing?.gmailThreadId ?? undefined,
+      campaignId: lead.campaignId ?? undefined,
+      leadId,
+    });
+    return ok({ kind: 'email', ...r }, 'Reply sent');
+  });
+
+  // Lead-level bookings (any booking_requests where guest_email == lead.email).
+  // Powers the LeadDetail center-column "Calendar" widget so the operator can
+  // see what this lead has already booked / pending without leaving the panel.
+  app.get(`${base}/:leadId/bookings`, { preHandler: READ }, async (req) => {
+    const { leadId } = parsePath(LeadPath, req.params);
+    const lead = await leadService.getById(req.workspace!.id, leadId);
+    const items = await bookingPageService.listRequestsByGuestEmail(
+      req.workspace!.id,
+      lead.email,
+    );
+    return ok({ items });
   });
 
   // ---- Workspace-level suppression list ----

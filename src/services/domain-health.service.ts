@@ -5,9 +5,12 @@
  * selector override.
  */
 import { promises as dns } from 'node:dns';
-import { and, desc, eq } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, sql } from 'drizzle-orm';
 import { getDb } from '../config/db';
 import { gmailAccounts } from '../db/schema/gmail-accounts';
+import { workspaces } from '../db/schema/workspaces';
+import { workspaceMembers } from '../db/schema/workspace-members';
+import { emailMessages } from '../db/schema/email-messages';
 import { domainHealthChecks, type DomainHealthCheck, type NewDomainHealthCheck } from '../db/schema/domain-health-checks';
 
 export type CheckStatus = 'pass' | 'fail' | 'unknown';
@@ -93,14 +96,128 @@ export async function checkDomain(domain: string, dkimSelector = GOOGLE_DKIM_SEL
   };
 }
 
+export interface ActivityMetrics {
+  sendVolume: number;
+  bounceRate: number; // 0–1
+  replyRate: number; // 0–1
+  unsubscribeRate: number; // 0–1
+}
+
+const ACTIVITY_WINDOW_DAYS = 14;
+
+/**
+ * Real sending activity for a Gmail account over a rolling window — drawn from
+ * email_messages (outbound counts + classified inbound). This is what makes
+ * reputation respond to behaviour rather than just DNS.
+ */
+export async function computeAccountActivity(
+  workspaceId: string,
+  accountEmail: string,
+): Promise<ActivityMetrics> {
+  const db = getDb();
+  const since = new Date(Date.now() - ACTIVITY_WINDOW_DAYS * 86_400_000);
+  const like = `%${accountEmail.toLowerCase()}%`;
+
+  const outRows = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(emailMessages)
+    .where(
+      and(
+        eq(emailMessages.workspaceId, workspaceId),
+        eq(emailMessages.direction, 'outbound'),
+        gte(emailMessages.createdAt, since),
+        sql`lower(${emailMessages.fromEmail}) like ${like}`,
+      ),
+    );
+  const sendVolume = outRows[0]?.n ?? 0;
+
+  const inboundRows = await db
+    .select({ cls: emailMessages.aiClassification, n: sql<number>`count(*)::int` })
+    .from(emailMessages)
+    .where(
+      and(
+        eq(emailMessages.workspaceId, workspaceId),
+        eq(emailMessages.direction, 'inbound'),
+        gte(emailMessages.createdAt, since),
+        sql`lower(${emailMessages.toEmail}) like ${like}`,
+      ),
+    )
+    .groupBy(emailMessages.aiClassification);
+
+  let bounces = 0;
+  let unsub = 0;
+  let replies = 0;
+  for (const r of inboundRows) {
+    const c = r.cls ?? '';
+    if (c === 'bounce' || c === 'close_bounced') bounces += r.n;
+    else if (c === 'unsubscribe' || c === 'close_unsubscribed') unsub += r.n;
+    else replies += r.n;
+  }
+  const denom = sendVolume || 1;
+  return {
+    sendVolume,
+    bounceRate: bounces / denom,
+    replyRate: replies / denom,
+    unsubscribeRate: unsub / denom,
+  };
+}
+
+/** Blend DNS score with live activity. Bounces are the dominant penalty. */
+function blendScore(dnsScore: number, m: ActivityMetrics): { score: number; notes: string[] } {
+  const notes: string[] = [];
+  let score = dnsScore;
+  if (m.sendVolume >= 5) {
+    if (m.bounceRate >= 0.05) {
+      score -= 40;
+      notes.push(`Bounce rate ${(m.bounceRate * 100).toFixed(1)}% — critical, pause sends and warm up`);
+    } else if (m.bounceRate >= 0.02) {
+      score -= 20;
+      notes.push(`Bounce rate ${(m.bounceRate * 100).toFixed(1)}% — elevated, clean the list`);
+    } else if (m.bounceRate >= 0.01) {
+      score -= 8;
+      notes.push(`Bounce rate ${(m.bounceRate * 100).toFixed(1)}% — watch it`);
+    }
+    if (m.unsubscribeRate >= 0.02) {
+      score -= 10;
+      notes.push(`Unsubscribe rate ${(m.unsubscribeRate * 100).toFixed(1)}% — high`);
+    }
+    if (m.replyRate >= 0.1) {
+      score += 5;
+      notes.push(`Healthy reply rate ${(m.replyRate * 100).toFixed(0)}%`);
+    }
+  } else {
+    notes.push('Low send volume — reputation based on DNS only');
+  }
+  return { score: Math.max(0, Math.min(100, Math.round(score))), notes };
+}
+
 export async function checkAndPersist(input: {
   workspaceId: string;
   gmailAccountId?: string;
   domain: string;
   dkimSelector?: string;
+  accountEmail?: string;
 }): Promise<DomainHealthCheck> {
   const result = await checkDomain(input.domain, input.dkimSelector);
   const db = getDb();
+
+  // Resolve the account email so we can pull real activity.
+  let accountEmail = input.accountEmail;
+  if (!accountEmail && input.gmailAccountId) {
+    const a = await db
+      .select({ email: gmailAccounts.email })
+      .from(gmailAccounts)
+      .where(eq(gmailAccounts.id, input.gmailAccountId))
+      .limit(1);
+    accountEmail = a[0]?.email;
+  }
+
+  const metrics = accountEmail
+    ? await computeAccountActivity(input.workspaceId, accountEmail)
+    : { sendVolume: 0, bounceRate: 0, replyRate: 0, unsubscribeRate: 0 };
+  const blended = blendScore(result.healthScore, metrics);
+  const recommendation = [result.recommendation, ...blended.notes].filter(Boolean).join('; ');
+
   const [row] = await db
     .insert(domainHealthChecks)
     .values({
@@ -111,14 +228,18 @@ export async function checkAndPersist(input: {
       dkimStatus: result.dkimStatus,
       dmarcStatus: result.dmarcStatus,
       mxStatus: result.mxStatus,
-      healthScore: result.healthScore,
-      recommendation: result.recommendation,
+      bounceRate: metrics.bounceRate.toFixed(4),
+      unsubscribeRate: metrics.unsubscribeRate.toFixed(4),
+      replyRate: metrics.replyRate.toFixed(4),
+      sendVolume: metrics.sendVolume,
+      healthScore: blended.score,
+      recommendation,
     } as NewDomainHealthCheck)
     .returning();
 
   // Sync the high-level health_status on the gmail_account
   if (input.gmailAccountId) {
-    const healthStatus = result.healthScore >= 80 ? 'healthy' : result.healthScore >= 50 ? 'warning' : 'at_risk';
+    const healthStatus = blended.score >= 80 ? 'healthy' : blended.score >= 50 ? 'warning' : 'at_risk';
     await db
       .update(gmailAccounts)
       .set({ healthStatus, updatedAt: new Date() })
@@ -137,6 +258,92 @@ export async function latestForWorkspace(workspaceId: string): Promise<DomainHea
     .limit(50);
 }
 
+export interface AccountHealth {
+  id: string;
+  email: string;
+  domain: string | null;
+  workspaceId: string;
+  workspaceName: string;
+  healthStatus: string;
+  latestCheck: DomainHealthCheck | null;
+}
+
+export interface SystemDomainHealth {
+  accounts: AccountHealth[];
+  summary: {
+    total: number;
+    healthy: number;
+    warning: number;
+    atRisk: number;
+    worst: 'healthy' | 'warning' | 'at_risk' | 'unknown';
+  };
+}
+
+/**
+ * Sender reputation across EVERY workspace the user belongs to — the system is
+ * monitored as a whole, not per workspace.
+ */
+export async function domainHealthForUser(userId: string): Promise<SystemDomainHealth> {
+  const db = getDb();
+  const empty: SystemDomainHealth = {
+    accounts: [],
+    summary: { total: 0, healthy: 0, warning: 0, atRisk: 0, worst: 'unknown' },
+  };
+
+  const memberRows = await db
+    .select({ wid: workspaceMembers.workspaceId })
+    .from(workspaceMembers)
+    .where(eq(workspaceMembers.userId, userId));
+  const wids = memberRows.map((m) => m.wid);
+  if (wids.length === 0) return empty;
+
+  const wsRows = await db
+    .select({ id: workspaces.id, name: workspaces.name })
+    .from(workspaces)
+    .where(inArray(workspaces.id, wids));
+  const wsName = new Map(wsRows.map((w) => [w.id, w.name]));
+
+  const accounts = await db
+    .select()
+    .from(gmailAccounts)
+    .where(and(inArray(gmailAccounts.workspaceId, wids), eq(gmailAccounts.isActive, true)));
+
+  const out: AccountHealth[] = [];
+  for (const a of accounts) {
+    const checks = await db
+      .select()
+      .from(domainHealthChecks)
+      .where(eq(domainHealthChecks.gmailAccountId, a.id))
+      .orderBy(desc(domainHealthChecks.checkedAt))
+      .limit(1);
+    out.push({
+      id: a.id,
+      email: a.email,
+      domain: a.domain,
+      workspaceId: a.workspaceId,
+      workspaceName: wsName.get(a.workspaceId) ?? '—',
+      healthStatus: a.healthStatus,
+      latestCheck: checks[0] ?? null,
+    });
+  }
+
+  let healthy = 0;
+  let warning = 0;
+  let atRisk = 0;
+  for (const a of out) {
+    if (a.healthStatus === 'healthy') healthy++;
+    else if (a.healthStatus === 'warning') warning++;
+    else if (a.healthStatus === 'at_risk' || a.healthStatus === 'paused') atRisk++;
+  }
+  const worst: SystemDomainHealth['summary']['worst'] =
+    atRisk > 0 ? 'at_risk' : warning > 0 ? 'warning' : healthy > 0 ? 'healthy' : 'unknown';
+
+  return {
+    accounts: out,
+    summary: { total: out.length, healthy, warning, atRisk, worst },
+  };
+}
+
 export async function checkAllActive(): Promise<{ checked: number; failed: number }> {
   const db = getDb();
   const accounts = await db.select().from(gmailAccounts).where(and(eq(gmailAccounts.isActive, true)));
@@ -145,7 +352,12 @@ export async function checkAllActive(): Promise<{ checked: number; failed: numbe
   for (const a of accounts) {
     if (!a.domain) continue;
     try {
-      await checkAndPersist({ workspaceId: a.workspaceId, gmailAccountId: a.id, domain: a.domain });
+      await checkAndPersist({
+        workspaceId: a.workspaceId,
+        gmailAccountId: a.id,
+        domain: a.domain,
+        accountEmail: a.email,
+      });
       checked++;
     } catch {
       failed++;

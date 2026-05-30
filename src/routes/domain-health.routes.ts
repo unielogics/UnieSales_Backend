@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { requireAuth } from '../middleware/auth';
 import { requireWorkspaceMembership, requireWorkspaceRole } from '../middleware/workspace';
 import { ok } from '../services/response.service';
-import { ValidationError } from '../utils/errors';
+import { UnauthorizedError, ValidationError } from '../utils/errors';
 import * as dh from '../services/domain-health.service';
 
 const CheckSchema = z.object({
@@ -28,6 +28,12 @@ const WRITE = [requireAuth, requireWorkspaceMembership, requireWorkspaceRole('ad
 
 export async function registerDomainHealthRoutes(app: FastifyInstance): Promise<void> {
   const base = '/api/workspaces/:workspaceId/domain-health';
+
+  // System-wide: sender reputation across every workspace the user belongs to.
+  app.get('/api/domain-health', { preHandler: requireAuth }, async (req) => {
+    if (!req.user) throw new UnauthorizedError();
+    return ok(await dh.domainHealthForUser(req.user.id));
+  });
 
   app.get(base, { preHandler: READ }, async (req) => {
     return ok({ checks: await dh.latestForWorkspace(req.workspace!.id) });

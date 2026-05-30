@@ -16,7 +16,7 @@ async function main() {
   while (!shouldStop) {
     try {
       const stats = await runFollowups({ limit: 50 });
-      if (stats.scanned > 0) log.info({ stats }, 'followup tick');
+      if (stats.scanned > 0 || stats.coldQueued > 0) log.info({ stats }, 'followup tick');
     } catch (err) {
       log.error({ err }, 'followup tick failed');
     }

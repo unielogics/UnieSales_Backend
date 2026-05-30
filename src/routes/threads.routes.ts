@@ -6,24 +6,28 @@ import { ok } from '../services/response.service';
 import { ConflictError, ValidationError } from '../utils/errors';
 import * as threadService from '../services/thread.service';
 import * as aiTasks from '../services/ai-tasks.service';
+import * as calendarService from '../services/calendar.service';
+import * as leadService from '../services/lead.service';
 import { sendEmail } from '../services/gmail.service';
+import { sendSmsToLead } from '../services/sms.service';
 
 const ListQuery = z.object({
   campaignId: z.string().uuid().optional(),
   limit: z.coerce.number().int().positive().max(500).optional(),
   offset: z.coerce.number().int().nonnegative().optional(),
+  // Sales-vs-Campaigns isolation: filters threads by their linked lead's
+  // import_origin. Same semantics as the /leads endpoint.
+  origin: z.enum(['intake', 'outbound']).optional(),
 });
 
 const ThreadPath = z.object({ workspaceId: z.string().uuid(), threadId: z.string().uuid() });
-const HandoffPath = z.object({ workspaceId: z.string().uuid(), leadId: z.string().uuid() });
 
 const SendReplySchema = z.object({
   subject: z.string().min(1).max(998).optional(),
   body: z.string().min(1).max(200_000),
 });
 const StopSchema = z.object({ reason: z.string().max(500).optional() });
-const HandoffCreateSchema = z.object({ summary: z.string().max(4000).optional() });
-const HandoffResolveSchema = z.object({ resolution: z.enum(['continue', 'closed']).optional() });
+const HandoffSchema = z.object({ reason: z.string().max(4000).optional() });
 
 function parseBody<T extends z.ZodTypeAny>(s: T, b: unknown): z.infer<T> {
   const r = s.safeParse(b);
@@ -64,7 +68,9 @@ export async function registerThreadRoutes(app: FastifyInstance): Promise<void> 
 
   app.get(base, { preHandler: READ }, async (req) => {
     const q = parseQuery(ListQuery, req.query);
-    return ok(await threadService.list(req.workspace!.id, q));
+    const r = await threadService.list(req.workspace!.id, q);
+    // Frontend expects `threads`; service returns `items` — map it here.
+    return ok({ threads: r.items, limit: r.limit, offset: r.offset });
   });
 
   app.get(`${base}/:threadId`, { preHandler: READ }, async (req) => {
@@ -90,29 +96,89 @@ export async function registerThreadRoutes(app: FastifyInstance): Promise<void> 
     if (!t.campaignId || !t.leadId) {
       throw new ConflictError('Thread is missing campaign or lead linkage');
     }
+    const calConfig = await calendarService.getCalendarConfig(req.workspace!.id);
     const result = await aiTasks.classifyReply({
       workspaceId: req.workspace!.id,
       campaignId: t.campaignId,
       leadId: t.leadId,
       threadId: t.id,
+      schedulingHint: { nowIso: new Date().toISOString(), timezone: calConfig.timezone },
     });
-    return ok({ ai: { actionId: result.action.id, ...result.output } });
+
+    const out = { ...result.output };
+    let meetEvent: Awaited<ReturnType<typeof calendarService.bookMeetingFromReply>>['event'] | null = null;
+
+    // call_scheduled → the lead picked a time: book that exact slot (if valid).
+    // meeting_request → the lead wants to meet but hasn't picked: offer real
+    // open calendar slots in the draft, don't book yet.
+    if (out.classification === 'call_scheduled' && out.proposed_time) {
+      const when = new Date(out.proposed_time);
+      if (calendarService.isWithinBookableHours(when, calConfig)) {
+        try {
+          const booked = await calendarService.bookMeetingFromReply({
+            workspaceId: req.workspace!.id,
+            leadId: t.leadId,
+            campaignId: t.campaignId,
+            emailThreadId: t.id,
+            proposedTime: when,
+          });
+          meetEvent = booked.event;
+          const niceTime = calendarService.formatSlotLabel(when, calConfig.timezone);
+          const linkLine = booked.meetLink ? ` Here's the video link: ${booked.meetLink}` : '';
+          out.reply_body =
+            `${out.reply_body ?? ''}\n\nYou're all set — I've sent a calendar invite for ${niceTime}.${linkLine}`.trim();
+          out.should_create_draft = true;
+          await leadService.update(req.workspace!.id, t.leadId, { status: 'call_scheduled' });
+        } catch {
+          // Booking failed — return the classification anyway.
+        }
+      }
+    } else if (out.classification === 'meeting_request') {
+      try {
+        const { slots } = await calendarService.computeAvailableSlots(req.workspace!.id);
+        if (slots.length > 0) {
+          const lines = slots.map((s) => `  - ${s.label}`).join('\n');
+          out.reply_body =
+            `${out.reply_body ?? ''}\n\nHere are a few times that work on my end:\n${lines}\n\n` +
+            `Reply with whichever suits you and I'll send over a calendar invite.`;
+          out.reply_body = out.reply_body.trim();
+          out.should_create_draft = true;
+        }
+        await leadService.update(req.workspace!.id, t.leadId, { status: 'meeting_requested' });
+      } catch {
+        // Slot computation failed — return the classification anyway.
+      }
+    }
+
+    return ok({ ai: { actionId: result.action.id, ...out }, meetEvent });
   });
 
   app.post(`${base}/:threadId/send-reply`, { preHandler: WRITE }, async (req) => {
     const { threadId } = parsePath(ThreadPath, req.params);
     const input = parseBody(SendReplySchema, req.body);
     const t = await threadService.getById(req.workspace!.id, threadId);
-    if (!t.gmailAccountId) throw new ConflictError('Thread has no gmail account');
     const lead = t.lead;
     if (!lead) throw new ConflictError('Thread has no lead');
+
+    // Channel-aware dispatch: SMS threads send via Twilio, email threads via
+    // Gmail. The composer body is the same either way.
+    if (t.channel === 'sms') {
+      const r = await sendSmsToLead({
+        workspaceId: req.workspace!.id,
+        leadId: lead.id,
+        body: input.body,
+      });
+      return ok({ messageId: r.messageId, twilioSid: r.twilioSid }, 'SMS sent');
+    }
+
+    if (!t.gmailAccountId) throw new ConflictError('Thread has no gmail account');
     const r = await sendEmail({
       workspaceId: req.workspace!.id,
       gmailAccountId: t.gmailAccountId,
       to: lead.email,
       subject: input.subject ?? (t.subject ? `Re: ${t.subject}` : 'Re:'),
       body: input.body,
-      threadId: t.gmailThreadId,
+      threadId: t.gmailThreadId ?? undefined,
       campaignId: t.campaignId ?? undefined,
       leadId: t.leadId ?? undefined,
     });
@@ -121,7 +187,11 @@ export async function registerThreadRoutes(app: FastifyInstance): Promise<void> 
 
   app.post(`${base}/:threadId/handoff`, { preHandler: WRITE }, async (req) => {
     const { threadId } = parsePath(ThreadPath, req.params);
-    return ok({ thread: await threadService.handoff(req.workspace!.id, threadId) }, 'Handed off');
+    const body = parseBody(HandoffSchema, req.body ?? {});
+    return ok(
+      { thread: await threadService.handoff(req.workspace!.id, threadId, body.reason) },
+      'Handed off',
+    );
   });
 
   app.post(`${base}/:threadId/stop-sequence`, { preHandler: WRITE }, async (req) => {
@@ -133,29 +203,13 @@ export async function registerThreadRoutes(app: FastifyInstance): Promise<void> 
     );
   });
 
-  // ---- Handoff queue ----
-  const handoffsBase = '/api/workspaces/:workspaceId/handoffs';
-
-  app.get(handoffsBase, { preHandler: READ }, async (req) => {
-    return ok({ leads: await threadService.listHandoffs(req.workspace!.id) });
-  });
-
-  app.post(`${handoffsBase}/:leadId/create`, { preHandler: WRITE }, async (req, reply) => {
-    const { leadId } = parsePath(HandoffPath, req.params);
-    const body = parseBody(HandoffCreateSchema, req.body ?? {});
-    reply.code(201);
-    return ok(
-      { lead: await threadService.createHandoff(req.workspace!.id, leadId, body.summary) },
-      'Handoff created',
+  // Bulk-dismiss threads from the Inbox view. Right-click + Ctrl+multi UI.
+  app.post(`${base}/bulk-dismiss`, { preHandler: WRITE }, async (req) => {
+    const body = parseBody(
+      z.object({ threadIds: z.array(z.string().uuid()).min(1).max(500) }),
+      req.body,
     );
-  });
-
-  app.post(`${handoffsBase}/:leadId/resolve`, { preHandler: WRITE }, async (req) => {
-    const { leadId } = parsePath(HandoffPath, req.params);
-    const body = parseBody(HandoffResolveSchema, req.body ?? {});
-    return ok(
-      { lead: await threadService.resolveHandoff(req.workspace!.id, leadId, body.resolution ?? 'continue') },
-      'Handoff resolved',
-    );
+    const r = await threadService.bulkDismiss(req.workspace!.id, body.threadIds);
+    return ok(r, `${r.dismissed} threads dismissed`);
   });
 }

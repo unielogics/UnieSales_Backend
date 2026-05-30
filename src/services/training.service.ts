@@ -121,7 +121,7 @@ export async function getSession(
 // ---- chat turn ----
 
 const ChatTurnInput = z.object({
-  message: z.string().min(1).max(8000),
+  message: z.string().min(1).max(20000),
 });
 
 export async function sendUserMessage(input: {
@@ -129,6 +129,13 @@ export async function sendUserMessage(input: {
   campaignId: string;
   sessionId: string;
   userMessage: string;
+  /**
+   * When true: persist the user turn but skip the AI call entirely. Used by
+   * the frontend's auto-chunker to ship long pastes as multiple sequential
+   * turns — only the final chunk fires the AI so we don't pay for N replies
+   * to fragments of a single thought.
+   */
+  silent?: boolean;
 }): Promise<{ session: TrainingSessionWithMessages; reply: string }> {
   const db = getDb();
   ChatTurnInput.parse({ message: input.userMessage });
@@ -146,6 +153,14 @@ export async function sendUserMessage(input: {
     role: 'user',
     message: input.userMessage,
   } as NewCampaignTrainingMessage);
+
+  // Silent mode: caller is chunking a long paste. Return the freshened
+  // session with no AI reply — the next non-silent turn will trigger the
+  // reply with all chunks already in conversation history.
+  if (input.silent) {
+    const refreshed = await getSession(input.workspaceId, input.campaignId, input.sessionId);
+    return { session: refreshed, reply: '' };
+  }
 
   // Build the rolling conversation. Cap at the last ~30 messages so we don't blow the prompt.
   const fresh = await getSession(input.workspaceId, input.campaignId, input.sessionId);

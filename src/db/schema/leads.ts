@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, integer, boolean, timestamp, index, uniqueIndex } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, text, integer, boolean, timestamp, jsonb, index, uniqueIndex } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import { workspaces } from './workspaces';
 import { campaigns } from './campaigns';
@@ -15,6 +15,12 @@ export const leads = pgTable(
     companyName: text('company_name'),
     website: text('website'),
     contactName: text('contact_name'),
+    // First and last name split out from contactName when the upstream form
+    // supplied a single Name field. Forms that already send the split (e.g.
+    // UnieCortex) populate these directly. The AI prompts prefer firstName
+    // for greetings; contactName remains the canonical full name.
+    firstName: text('first_name'),
+    lastName: text('last_name'),
     email: text('email').notNull(),
     phone: text('phone'),
     title: text('title'),
@@ -30,6 +36,13 @@ export const leads = pgTable(
     sourceUrl: text('source_url'),
     sourceNotes: text('source_notes'),
 
+    // Per-campaign custom fields — operator-defined column mappings (e.g.
+    // `fleet_size`, `wms_in_use`, `revenue_range`) imported from CSV/Sheet
+    // sources. Schema-less by design: each campaign decides its own keys. The
+    // AI receives this map in context and may reference any value when
+    // scoring, classifying, or drafting outbound copy.
+    customFields: jsonb('custom_fields').$type<Record<string, string>>(),
+
     leadScore: integer('lead_score').notNull().default(0),
     leadScoreReason: text('lead_score_reason'),
     painAngle: text('pain_angle'),
@@ -37,6 +50,17 @@ export const leads = pgTable(
 
     status: text('status').notNull().default('new'),
     lifecycleStatus: text('lifecycle_status').notNull().default('active'),
+
+    // Sales conversion pipeline stage (slug from pipeline_stages, or one of
+    // the default seeded stages for inbound campaigns). Nullable until the
+    // post-intake runner sets it. Indexed below for board/table queries.
+    pipelineStage: text('pipeline_stage'),
+
+    // Stamp set by the post-intake runner when it has completed all triage
+    // work for this lead (score + classify + intake_summary note + suggested
+    // next action). Used as a fast idempotency check — null means the runner
+    // hasn't seen this lead yet; non-null means skip.
+    postIntakeProcessedAt: timestamp('post_intake_processed_at', { withTimezone: false }),
 
     closeReason: text('close_reason'),
     closedAt: timestamp('closed_at', { withTimezone: false }),
@@ -56,7 +80,30 @@ export const leads = pgTable(
     hubspotContactId: text('hubspot_contact_id'),
     sheetRowId: text('sheet_row_id'),
 
+    // How the lead first entered: 'upload' (a source's initial import),
+    // 'update' (a later refresh of a source). Null for manual/warm-up leads.
+    importOrigin: text('import_origin'),
+
+    // Contact channel: 'email' (default) or 'sms'. Set at import: email if a
+    // valid email is mapped, sms if phone-only.
+    channel: text('channel').notNull().default('email'),
+
     aiOwner: boolean('ai_owner').notNull().default(true),
+
+    // Soft-delete timestamp. When non-null, the lead is hidden from every
+    // UI surface (inbound list, inbox, queue, calendar, pipeline) and every
+    // AI worker (followup, scoring, classify) — they all filter
+    // `deleted_at IS NULL`. Set via the lead bulk-delete endpoint; cleared
+    // (currently no UI for un-delete, but the column is restore-friendly).
+    deletedAt: timestamp('deleted_at', { withTimezone: true }),
+
+    // Email send failure marker. Set when a Gmail send to lead.email fails
+    // permanently (bounce, invalid address, etc.). Followup worker filters
+    // these out — the AI never retries to a known-broken email. Reset by
+    // the leads PATCH handler when `email` is updated, so a corrected
+    // address is eligible again.
+    emailSendFailedAt: timestamp('email_send_failed_at', { withTimezone: true }),
+    emailSendFailReason: text('email_send_fail_reason'),
 
     createdAt: timestamp('created_at', { withTimezone: false }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: false }).notNull().defaultNow(),
@@ -64,6 +111,7 @@ export const leads = pgTable(
   (t) => ({
     workspaceIdx: index('leads_workspace_idx').on(t.workspaceId),
     workspaceStatusIdx: index('leads_workspace_status_idx').on(t.workspaceId, t.status),
+    workspacePipelineIdx: index('leads_workspace_pipeline_idx').on(t.workspaceId, t.pipelineStage),
     campaignIdx: index('leads_campaign_idx').on(t.campaignId),
     gmailThreadIdx: index('leads_gmail_thread_idx').on(t.gmailThreadId),
     // De-dupe per workspace+campaign on case-insensitive email

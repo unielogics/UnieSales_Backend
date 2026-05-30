@@ -28,6 +28,13 @@ const EnvSchema = z.object({
   HUBSPOT_CLIENT_ID: z.string().default(''),
   HUBSPOT_CLIENT_SECRET: z.string().default(''),
 
+  // Twilio (SMS channel). FROM_NUMBER is the E.164 number used for outbound;
+  // MESSAGING_SERVICE_SID is preferred when set (carries 10DLC + opt-out + pooling).
+  TWILIO_ACCOUNT_SID: z.string().default(''),
+  TWILIO_AUTH_TOKEN: z.string().default(''),
+  TWILIO_FROM_NUMBER: z.string().default(''),
+  TWILIO_MESSAGING_SERVICE_SID: z.string().default(''),
+
   JWT_SECRET: z.string().min(32),
   ENCRYPTION_KEY: z.string().regex(/^[0-9a-fA-F]{64}$/, 'ENCRYPTION_KEY must be 64 hex chars (32 bytes)'),
 
@@ -37,6 +44,18 @@ const EnvSchema = z.object({
 
   CORS_ORIGINS: z.string().default(''),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
+
+  // Shared secret used to verify HMAC signatures on the public uniecortex
+  // intake endpoint (server-to-server mirror from CortexBackend). The same
+  // value is provisioned out-of-band into the Cortex deploy so its requests
+  // can be signed with HMAC-SHA256. Optional in dev; required in production
+  // for the cortex endpoint to accept anything.
+  UNIESALES_INTAKE_HMAC_SECRET: z.string().default(''),
+
+  // Firebase service-account JSON (stringified) for FCM push delivery to the
+  // mobile app. Optional — when empty, notifications are still persisted but
+  // no push is sent. Provisioned in Secrets Manager for Phase 3 (mobile push).
+  FIREBASE_SERVICE_ACCOUNT_JSON: z.string().default(''),
 });
 
 export type Env = z.infer<typeof EnvSchema>;

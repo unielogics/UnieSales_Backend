@@ -22,3 +22,8 @@ export * from './campaign-exit-rules';
 export * from './campaign-test-scenarios';
 export * from './suppression-list';
 export * from './domain-health-checks';
+export * from './handoffs';
+export * from './calendar-events';
+export * from './notifications';
+export * from './notification-settings';
+export * from './push-subscriptions';

@@ -1,5 +1,6 @@
 import { and, eq } from 'drizzle-orm';
 import { parse as parseCsvSync } from 'csv-parse/sync';
+import * as XLSX from 'xlsx';
 import { getDb } from '../config/db';
 import {
   campaignLeadSources,
@@ -9,6 +10,7 @@ import {
   type LeadSourceType,
 } from '../db/schema/campaign-lead-sources';
 import { leads } from '../db/schema/leads';
+import { suppressionList } from '../db/schema/suppression-list';
 import { knowledgeKey, putObject, getObjectBuffer, s3UriFor } from './s3.service';
 import { NotFoundError, ValidationError, ConflictError } from '../utils/errors';
 
@@ -34,13 +36,28 @@ const SYSTEM_FIELDS = [
 ] as const;
 export type SystemField = (typeof SYSTEM_FIELDS)[number];
 
+// Custom-field mapping values use the `custom:<slug>` form so they coexist
+// with the fixed SystemField strings inside the same `field_mapping` JSONB.
+// The slug becomes the key inside `leads.custom_fields` and the label the AI
+// sees in its context, so it must be safe for prompts and JSON.
+export type CustomFieldKey = `custom:${string}`;
+export type MappedField = SystemField | CustomFieldKey;
+const CUSTOM_SLUG_RE = /^[a-z][a-z0-9_]{0,49}$/;
+
 export interface FieldMapping {
-  // sourceColumn → systemField. Columns absent from this map are ignored.
-  [sourceColumn: string]: SystemField;
+  // sourceColumn → mappedField. Columns absent from this map are ignored.
+  // mappedField is either a SystemField or `custom:<slug>`.
+  [sourceColumn: string]: MappedField;
 }
 
 function isSystemField(s: string): s is SystemField {
   return (SYSTEM_FIELDS as readonly string[]).includes(s);
+}
+
+function parseCustomKey(s: string): string | null {
+  if (!s.startsWith('custom:')) return null;
+  const slug = s.slice('custom:'.length);
+  return CUSTOM_SLUG_RE.test(slug) ? slug : null;
 }
 
 export function validateFieldMapping(raw: unknown): FieldMapping {
@@ -49,20 +66,107 @@ export function validateFieldMapping(raw: unknown): FieldMapping {
   }
   const out: FieldMapping = {};
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
-    if (typeof v !== 'string' || !isSystemField(v)) {
+    if (typeof v !== 'string') {
       throw new ValidationError(`fieldMapping[${k}] invalid`, [
-        { field: `fieldMapping.${k}`, reason: `value must be one of ${SYSTEM_FIELDS.join(', ')}` },
+        { field: `fieldMapping.${k}`, reason: 'value must be a string' },
       ]);
     }
-    out[k] = v;
+    if (isSystemField(v)) {
+      out[k] = v;
+    } else if (parseCustomKey(v)) {
+      out[k] = v as CustomFieldKey;
+    } else {
+      throw new ValidationError(`fieldMapping[${k}] invalid`, [
+        {
+          field: `fieldMapping.${k}`,
+          reason: `value must be one of [${SYSTEM_FIELDS.join(', ')}] or "custom:<slug>" (lowercase a-z, 0-9, _; must start with a letter; max 50 chars)`,
+        },
+      ]);
+    }
   }
-  // email must be mapped or import will fail; surface that now
-  if (!Object.values(out).includes('email')) {
-    throw new ValidationError('fieldMapping must map at least one column to "email"', [
-      { field: 'fieldMapping', reason: 'no column mapped to email' },
-    ]);
+  // At least one of email / phone must be mapped — phone-only leads import
+  // as channel='sms' with a synthetic placeholder email for dedup.
+  const vals = Object.values(out);
+  if (!vals.includes('email') && !vals.includes('phone')) {
+    throw new ValidationError(
+      'fieldMapping must map at least one column to "email" or "phone"',
+      [{ field: 'fieldMapping', reason: 'no column mapped to email or phone' }],
+    );
   }
   return out;
+}
+
+// ---- Tabular file parsing ----
+
+/**
+ * Detect whether an uploaded buffer is an xlsx (Office Open XML) file. xlsx
+ * is a ZIP archive, so the first four bytes are the ZIP local-file signature
+ * `PK\x03\x04`. We check magic bytes rather than file extension because
+ * operators sometimes rename `.xlsx` files to `.csv` (or vice versa) and the
+ * content is the real source of truth.
+ */
+function looksLikeXlsx(buffer: Buffer): boolean {
+  return (
+    buffer.length >= 4 &&
+    buffer[0] === 0x50 && // P
+    buffer[1] === 0x4b && // K
+    buffer[2] === 0x03 &&
+    buffer[3] === 0x04
+  );
+}
+
+/**
+ * Parse a tabular upload (CSV or XLSX) into a `Record<string,string>[]`.
+ * Both formats are normalized into the same shape so the import + preview
+ * pipelines downstream stay format-agnostic.
+ *
+ * - CSV: first non-empty row is the header (csv-parse `columns: true`).
+ * - XLSX: first worksheet; first row is the header. Numbers/dates are
+ *   serialized to strings so the rest of the pipeline (trim, lowercase, etc.)
+ *   keeps working uniformly.
+ */
+export function parseTabularBuffer(buffer: Buffer, fileName: string): Record<string, string>[] {
+  const isXlsx = looksLikeXlsx(buffer) || /\.xlsx?$/i.test(fileName);
+  if (isXlsx) {
+    let wb: XLSX.WorkBook;
+    try {
+      wb = XLSX.read(buffer, { type: 'buffer', cellDates: true });
+    } catch (err) {
+      throw new ValidationError(
+        `Could not parse spreadsheet "${fileName}"`,
+        [{ field: 'file', reason: err instanceof Error ? err.message : 'unreadable xlsx' }],
+      );
+    }
+    const sheetName = wb.SheetNames[0];
+    if (!sheetName) {
+      throw new ValidationError(`Spreadsheet "${fileName}" has no sheets`, [
+        { field: 'file', reason: 'no sheets' },
+      ]);
+    }
+    const sheet = wb.Sheets[sheetName]!;
+    // `defval: ''` means missing cells become empty strings (matching CSV
+    // behavior). `raw: false` returns formatted text — dates as ISO strings,
+    // numbers as their display string.
+    const json = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, {
+      defval: '',
+      raw: false,
+    });
+    return json.map((row) => {
+      const out: Record<string, string> = {};
+      for (const [k, v] of Object.entries(row)) {
+        out[k] = v == null ? '' : String(v);
+      }
+      return out;
+    });
+  }
+  // CSV (default fallback — handles .csv, unknown extensions, BOM-prefixed UTF-8)
+  return parseCsvSync(buffer.toString('utf-8'), {
+    columns: true,
+    skip_empty_lines: true,
+    relax_quotes: true,
+    relax_column_count: true,
+    bom: true,
+  }) as Record<string, string>[];
 }
 
 // ---- CRUD ----
@@ -106,17 +210,34 @@ export async function createGoogleSheet(
   });
 }
 
+/**
+ * Persist an uploaded tabular file (CSV or XLSX) as a `csv_upload` lead
+ * source. The `sourceType` stays `csv_upload` for both formats — the parser
+ * downstream auto-detects the actual format from magic bytes and filename,
+ * so we don't need a separate enum value. (If we ever need to distinguish
+ * formats for billing / metrics, we can introduce a separate type later.)
+ */
 export async function createCsv(
   workspaceId: string,
   campaignId: string,
   input: { fileName: string; buffer: Buffer; contentType?: string; sourceName?: string; fieldMapping?: FieldMapping },
 ): Promise<CampaignLeadSource> {
-  // Store the raw CSV under the same prefix scheme as knowledge files for tenant isolation.
+  // Best-effort content-type. If the client didn't supply one (the common
+  // case from our frontend), infer from the file extension so the bytes
+  // round-trip cleanly through S3.
+  const inferredCt =
+    input.contentType ??
+    (/\.xlsx$/i.test(input.fileName)
+      ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      : /\.xls$/i.test(input.fileName)
+        ? 'application/vnd.ms-excel'
+        : 'text/csv');
+  // Store the raw file under the same prefix scheme as knowledge files for tenant isolation.
   const key = knowledgeKey(workspaceId, campaignId, `lead-source-${Date.now()}-${input.fileName}`);
   await putObject({
     key,
     body: input.buffer,
-    contentType: input.contentType ?? 'text/csv',
+    contentType: inferredCt,
     metadata: { workspace_id: workspaceId, campaign_id: campaignId, kind: 'lead_source_csv' },
   });
   return insertSource(workspaceId, campaignId, {
@@ -204,12 +325,9 @@ export async function preview(
     if (!src.uploadedFileUrl) throw new NotFoundError('Uploaded file URL missing');
     const key = src.uploadedFileUrl.replace(/^s3:\/\/[^/]+\//, '');
     const buf = await getObjectBuffer(key);
-    records = parseCsvSync(buf.toString('utf-8'), {
-      columns: true,
-      skip_empty_lines: true,
-      relax_quotes: true,
-      relax_column_count: true,
-    }) as Record<string, string>[];
+    // Filename hints at format when magic bytes are ambiguous (e.g. .csv).
+    // Preview/import was originally CSV-only; now it auto-detects xlsx too.
+    records = parseTabularBuffer(buf, src.sourceName ?? src.uploadedFileUrl);
   } else if (src.sourceType === 'google_sheet') {
     if (!src.googleSheetId) throw new NotFoundError('Google Sheet ID missing');
     const { readSheetRows } = await import('./drive.service');
@@ -232,6 +350,9 @@ export interface ImportResult {
   created: number;
   skipped_existing: number;
   skipped_invalid: number;
+  /** Rows whose email is on the workspace suppression list (bounce/unsubscribe).
+   *  Skipped to keep previously-burned addresses out of new outreach. */
+  skipped_suppressed: number;
   total_rows: number;
 }
 
@@ -250,12 +371,7 @@ export async function importNow(workspaceId: string, campaignId: string, sourceI
     if (!src.uploadedFileUrl) throw new NotFoundError('Uploaded file URL missing');
     const key = src.uploadedFileUrl.replace(/^s3:\/\/[^/]+\//, '');
     const buf = await getObjectBuffer(key);
-    rows = parseCsvSync(buf.toString('utf-8'), {
-      columns: true,
-      skip_empty_lines: true,
-      relax_quotes: true,
-      relax_column_count: true,
-    }) as Record<string, string>[];
+    rows = parseTabularBuffer(buf, src.sourceName ?? src.uploadedFileUrl);
   } else if (src.sourceType === 'google_sheet') {
     if (!src.googleSheetId) {
       throw new ConflictError('Google Sheet source missing googleSheetId', [
@@ -272,7 +388,9 @@ export async function importNow(workspaceId: string, campaignId: string, sourceI
     throw new ConflictError(`Unknown sourceType ${src.sourceType}`);
   }
 
-  return importRows(workspaceId, campaignId, src.id, rows, mapping);
+  // First import of a source = 'upload'; any later run = 'update' (refresh).
+  const origin: 'upload' | 'update' = src.lastImportedAt ? 'update' : 'upload';
+  return importRows(workspaceId, campaignId, src.id, rows, mapping, origin);
 }
 
 async function importRows(
@@ -281,6 +399,7 @@ async function importRows(
   sourceId: string,
   rows: Record<string, string>[],
   mapping: FieldMapping,
+  origin: 'upload' | 'update' = 'upload',
 ): Promise<ImportResult> {
   const db = getDb();
   await db
@@ -291,33 +410,90 @@ async function importRows(
   let created = 0;
   let skippedExisting = 0;
   let skippedInvalid = 0;
+  let skippedSuppressed = 0;
+
+  // Workspace suppression list — bounces, unsubscribes, SMS STOPs. Imported
+  // rows matching these addresses are never created, so we don't email a
+  // burned address just because they showed up again in a new file.
+  const suppRows = await db
+    .select({ email: suppressionList.email })
+    .from(suppressionList)
+    .where(eq(suppressionList.workspaceId, workspaceId));
+  const suppressed = new Set(suppRows.map((r) => r.email.toLowerCase()));
+
+  // Workspace-wide dedup. The DB's unique index catches duplicates within the
+  // same campaign; this set also blocks importing a lead that already lives
+  // in a SIBLING campaign — so re-uploading a CSV never resurrects a
+  // previously-contacted address for new outreach.
+  const existingRows = await db
+    .select({ email: leads.email })
+    .from(leads)
+    .where(eq(leads.workspaceId, workspaceId));
+  const existingEmails = new Set(existingRows.map((r) => r.email.toLowerCase()));
 
   for (const row of rows) {
     // Multiple CSV columns can map to the same system field (e.g. "Notes" +
     // "Why Fit" both → source_notes). Concatenate with " · " in that case so
     // no operator-curated context gets dropped.
     const mapped: Partial<Record<SystemField, string>> = {};
+    // Operator-defined custom fields: slug → value. Multiple CSV columns
+    // could map to the same custom slug, in which case we concatenate the
+    // values with " · " (same policy as free-text system fields).
+    const customMapped: Record<string, string> = {};
     for (const [col, val] of Object.entries(row)) {
-      const sys = mapping[col];
-      if (!sys || val == null) continue;
+      const target = mapping[col];
+      if (!target || val == null) continue;
       const trimmed = String(val).trim();
       if (trimmed === '') continue;
-      const existing = mapped[sys];
-      if (existing) {
-        // Free-text fields concatenate; structured fields take the first non-empty value
-        if (sys === 'source_notes' || sys === 'personalization' || sys === 'pain_angle') {
-          mapped[sys] = `${existing} · ${col}: ${trimmed}`;
+      if (isSystemField(target)) {
+        const sys = target;
+        const existing = mapped[sys];
+        if (existing) {
+          // Free-text fields concatenate; structured fields take the first non-empty value
+          if (sys === 'source_notes' || sys === 'personalization' || sys === 'pain_angle') {
+            mapped[sys] = `${existing} · ${col}: ${trimmed}`;
+          }
+          // else: keep first value
+        } else {
+          mapped[sys] = sys === 'source_notes' || sys === 'personalization' || sys === 'pain_angle'
+            ? `${col}: ${trimmed}`
+            : trimmed;
         }
-        // else: keep first value
       } else {
-        mapped[sys] = sys === 'source_notes' || sys === 'personalization' || sys === 'pain_angle'
-          ? `${col}: ${trimmed}`
-          : trimmed;
+        // custom:<slug>
+        const slug = parseCustomKey(target);
+        if (!slug) continue; // defence-in-depth — validator should have caught this
+        const existing = customMapped[slug];
+        customMapped[slug] = existing ? `${existing} · ${trimmed}` : trimmed;
       }
     }
-    const email = mapped.email?.toLowerCase();
-    if (!email || !isLikelyEmail(email)) {
+    // Channel decision: email if a real address is mapped; otherwise SMS if
+    // a phone exists. Phone-only leads get a synthetic placeholder email so
+    // the unique (workspace, email, campaign) dedup keeps working.
+    const rawEmail = mapped.email?.toLowerCase();
+    const hasEmail = !!rawEmail && isLikelyEmail(rawEmail);
+    const phoneDigits = String(mapped.phone ?? '').replace(/\D/g, '');
+    const phoneLast10 = phoneDigits.length >= 10 ? phoneDigits.slice(-10) : '';
+    let email: string;
+    let channel: 'email' | 'sms';
+    if (hasEmail) {
+      email = rawEmail!;
+      channel = 'email';
+    } else if (phoneLast10) {
+      email = `sms+${phoneLast10}@uniesales.local`;
+      channel = 'sms';
+    } else {
       skippedInvalid++;
+      continue;
+    }
+    // Hard guard: never re-import a previously-burned address (bounce / opt-out).
+    if (suppressed.has(email)) {
+      skippedSuppressed++;
+      continue;
+    }
+    // Workspace-wide dedup — already a lead somewhere in this workspace.
+    if (existingEmails.has(email)) {
+      skippedExisting++;
       continue;
     }
     try {
@@ -325,6 +501,7 @@ async function importRows(
         workspaceId,
         campaignId,
         email,
+        channel,
         companyName: mapped.company_name ?? null,
         contactName: mapped.contact_name ?? null,
         title: mapped.title ?? null,
@@ -340,7 +517,9 @@ async function importRows(
         sourceNotes: mapped.source_notes ?? null,
         personalization: mapped.personalization ?? null,
         painAngle: mapped.pain_angle ?? null,
+        customFields: Object.keys(customMapped).length > 0 ? customMapped : null,
         status: 'pending_review',
+        importOrigin: origin,
       });
       created++;
     } catch (err) {
@@ -351,17 +530,115 @@ async function importRows(
     }
   }
 
+  const result: ImportResult = {
+    created,
+    skipped_existing: skippedExisting,
+    skipped_invalid: skippedInvalid,
+    skipped_suppressed: skippedSuppressed,
+    total_rows: rows.length,
+  };
+
   await db
     .update(campaignLeadSources)
-    .set({ importStatus: 'completed', lastImportedAt: new Date(), updatedAt: new Date() })
+    .set({
+      importStatus: 'completed',
+      lastImportedAt: new Date(),
+      lastImportResult: result,
+      updatedAt: new Date(),
+    })
     .where(eq(campaignLeadSources.id, sourceId));
 
-  return { created, skipped_existing: skippedExisting, skipped_invalid: skippedInvalid, total_rows: rows.length };
+  return result;
 }
 
 function isLikelyEmail(s: string): boolean {
   // Cheap RFC-ish check; the spec'd unique index will catch true duplicates.
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+}
+
+// ---- Frequency + scheduled sync ----
+
+export const IMPORT_FREQUENCIES = ['manual', 'hourly', 'every_6h', 'daily'] as const;
+export type ImportFrequency = (typeof IMPORT_FREQUENCIES)[number];
+
+const FREQUENCY_MS: Record<string, number> = {
+  hourly: 60 * 60_000,
+  every_6h: 6 * 60 * 60_000,
+  daily: 24 * 60 * 60_000,
+};
+
+/** Update a source's import frequency / active flag. */
+export async function update(
+  workspaceId: string,
+  campaignId: string,
+  sourceId: string,
+  patch: { importFrequency?: ImportFrequency; isActive?: boolean },
+): Promise<CampaignLeadSource> {
+  await getById(workspaceId, campaignId, sourceId);
+  if (patch.importFrequency && !(IMPORT_FREQUENCIES as readonly string[]).includes(patch.importFrequency)) {
+    throw new ValidationError('Invalid import frequency', [
+      { field: 'importFrequency', reason: `one of ${IMPORT_FREQUENCIES.join(', ')}` },
+    ]);
+  }
+  const db = getDb();
+  const rows = await db
+    .update(campaignLeadSources)
+    .set({ ...patch, updatedAt: new Date() })
+    .where(eq(campaignLeadSources.id, sourceId))
+    .returning();
+  return rows[0]!;
+}
+
+export interface SyncAllResult {
+  imported: number;
+  failed: number;
+}
+
+/**
+ * Lead-source sync pass (run by the lead-source worker):
+ *  - Any mapped source still at importStatus='pending' → auto-import it
+ *    (a freshly connected sheet/CSV starts working without a manual click).
+ *  - Any google_sheet on a non-manual frequency whose lastImportedAt is older
+ *    than its interval → re-import to pull in newly added rows.
+ * importNow dedupes, so re-imports only create genuinely new leads.
+ */
+export async function importAllDue(): Promise<SyncAllResult> {
+  const db = getDb();
+  const sources = await db
+    .select()
+    .from(campaignLeadSources)
+    .where(eq(campaignLeadSources.isActive, true));
+
+  const now = Date.now();
+  let imported = 0;
+  let failed = 0;
+
+  for (const src of sources) {
+    if (!src.fieldMapping) continue; // not column-mapped yet — skip
+    const isNewPending = src.importStatus === 'pending';
+
+    let isRefreshDue = false;
+    if (src.sourceType === 'google_sheet' && src.importFrequency !== 'manual') {
+      const interval = FREQUENCY_MS[src.importFrequency];
+      if (interval) {
+        const last = src.lastImportedAt ? src.lastImportedAt.getTime() : 0;
+        isRefreshDue = now - last >= interval;
+      }
+    }
+    if (!isNewPending && !isRefreshDue) continue;
+
+    try {
+      await importNow(src.workspaceId, src.campaignId, src.id);
+      imported++;
+    } catch {
+      failed++;
+      await db
+        .update(campaignLeadSources)
+        .set({ importStatus: 'failed', updatedAt: new Date() })
+        .where(eq(campaignLeadSources.id, src.id));
+    }
+  }
+  return { imported, failed };
 }
 
 export { LEAD_SOURCE_TYPES };

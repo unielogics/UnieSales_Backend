@@ -20,6 +20,9 @@ export const gmailAccounts = pgTable(
 
     dailySendLimit: integer('daily_send_limit').notNull().default(25),
     dailySentCount: integer('daily_sent_count').notNull().default(0),
+    // When daily_sent_count was last rolled over to 0. The followup worker
+    // resets the counter once per calendar day.
+    dailyCountResetAt: timestamp('daily_count_reset_at', { withTimezone: false }),
     maxNewThreadsPerDay: integer('max_new_threads_per_day').notNull().default(25),
 
     warmupMode: boolean('warmup_mode').notNull().default(true),

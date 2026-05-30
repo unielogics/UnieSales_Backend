@@ -21,6 +21,8 @@ export interface CanSendInput {
   campaignId: string;
   leadId: string;
   gmailAccountId?: string;
+  /** Channel of the send being gated. 'sms' skips Gmail-specific checks. */
+  channel?: 'email' | 'sms';
   isAutoReply?: boolean;
   classification?: string;
   confidence?: number;
@@ -108,8 +110,10 @@ export async function canSend(input: CanSendInput): Promise<CanSendResult> {
     }
   }
 
-  // Gmail account
-  const gmailAccountId = input.gmailAccountId ?? cRow.gmailAccountId;
+  // Gmail account — only relevant for email sends. SMS sends are gated by
+  // the lead/campaign/suppression checks above; Twilio doesn't share Gmail's
+  // per-inbox quota model.
+  const gmailAccountId = input.channel === 'sms' ? null : input.gmailAccountId ?? cRow.gmailAccountId;
   if (gmailAccountId) {
     const gaRow = (await db.select().from(gmailAccounts).where(eq(gmailAccounts.id, gmailAccountId)).limit(1))[0];
     if (!gaRow) return { allowed: false, reason: 'gmail account not found' };

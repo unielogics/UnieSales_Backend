@@ -18,7 +18,13 @@ const CampaignPath = z.object({
   campaignId: z.string().uuid(),
 });
 
-const MessageSchema = z.object({ message: z.string().min(1).max(8000) });
+const MessageSchema = z.object({
+  message: z.string().min(1).max(20000),
+  // When true, persist the user message but DO NOT call the AI. Used by the
+  // frontend to ship long pastes as multiple silent chunks, then a final
+  // non-silent turn that triggers the AI reply with the full context in view.
+  silent: z.boolean().optional(),
+});
 
 function parseBody<T extends z.ZodTypeAny>(s: T, b: unknown): z.infer<T> {
   const r = s.safeParse(b);
@@ -71,6 +77,7 @@ export async function registerCampaignTrainingRoutes(app: FastifyInstance): Prom
       campaignId,
       sessionId,
       userMessage: input.message,
+      silent: input.silent ?? false,
     });
     return ok(r);
   });

@@ -88,9 +88,13 @@ async function main(): Promise<void> {
   // preflight requests are intentionally skipped because the frontend uses
   // Authorization headers, which doubles request count otherwise.
   await app.register(rateLimit, {
-    max: 1200,
+    max: 3000,
     timeWindow: '1 minute',
-    allowList: (req) => req.url === '/health' || req.method === 'OPTIONS',
+    allowList: (req) => {
+      if (req.url === '/health' || req.method === 'OPTIONS') return true;
+      const auth = req.headers.authorization;
+      return req.method === 'GET' && typeof auth === 'string' && auth.startsWith('Bearer ');
+    },
   });
 
   // Slow query log: warn on any handler taking longer than 1s.

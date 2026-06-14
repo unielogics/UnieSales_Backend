@@ -19,6 +19,7 @@ import { env } from '../config/env';
 import { createLogger } from '../config/logger';
 import { sendSms } from './twilio.service';
 import { ConflictError, NotFoundError } from '../utils/errors';
+import { recordCostEvent } from './cost.service';
 
 const log = createLogger(process.env.LOG_LEVEL ?? 'info').child({ service: 'sms' });
 
@@ -26,6 +27,10 @@ const log = createLogger(process.env.LOG_LEVEL ?? 'info').child({ service: 'sms'
 function phoneLast10(raw: string | null | undefined): string {
   const d = String(raw ?? '').replace(/\D/g, '');
   return d.length >= 10 ? d.slice(-10) : '';
+}
+
+function smsSegments(body: string): number {
+  return Math.max(1, Math.ceil((body || '').length / 160));
 }
 
 /** Best-effort E.164 normalization (US default if no country code). */
@@ -130,7 +135,7 @@ export async function recordInboundSms(input: {
     return { thread, lead, newInboundReply: null };
   }
 
-  await db.insert(emailMessages).values({
+  const [messageRow] = await db.insert(emailMessages).values({
     workspaceId: lead.workspaceId,
     campaignId: lead.campaignId ?? null,
     leadId: lead.id,
@@ -142,7 +147,29 @@ export async function recordInboundSms(input: {
     subject: null,
     body: input.body,
     twilioMessageSid: input.twilioMessageSid,
-  });
+  }).returning({ id: emailMessages.id, createdAt: emailMessages.createdAt });
+  if (messageRow) {
+    await recordCostEvent({
+      workspaceId: lead.workspaceId,
+      campaignId: lead.campaignId ?? null,
+      leadId: lead.id,
+      emailThreadId: thread.id,
+      emailMessageId: messageRow.id,
+      sourceObjectType: 'email_message',
+      sourceObjectId: messageRow.id,
+      dedupeKey: `message:${messageRow.id}:sms_segment`,
+      provider: 'twilio',
+      service: 'sms',
+      category: 'messaging',
+      actionType: 'sms_segment',
+      channel: 'sms',
+      quantity: smsSegments(input.body),
+      unit: 'segment',
+      costSource: 'estimated',
+      occurredAt: messageRow.createdAt,
+      metadata: { direction: 'inbound', twilioMessageSid: input.twilioMessageSid },
+    }).catch((err) => log.warn({ err }, 'cost record failed for inbound SMS'));
+  }
   await db
     .update(emailThreads)
     .set({ updatedAt: new Date(), lastInboundAt: new Date() })
@@ -193,7 +220,30 @@ export async function sendSmsToLead(input: {
       body: input.body,
       twilioMessageSid: sent.sid,
     })
-    .returning({ id: emailMessages.id });
+    .returning({ id: emailMessages.id, createdAt: emailMessages.createdAt });
+
+  if (msg) {
+    await recordCostEvent({
+      workspaceId: input.workspaceId,
+      campaignId: lead.campaignId ?? null,
+      leadId: lead.id,
+      emailThreadId: thread.id,
+      emailMessageId: msg.id,
+      sourceObjectType: 'email_message',
+      sourceObjectId: msg.id,
+      dedupeKey: `message:${msg.id}:sms_segment`,
+      provider: 'twilio',
+      service: 'sms',
+      category: 'messaging',
+      actionType: 'sms_segment',
+      channel: 'sms',
+      quantity: smsSegments(input.body),
+      unit: 'segment',
+      costSource: 'estimated',
+      occurredAt: msg.createdAt,
+      metadata: { direction: 'outbound', twilioMessageSid: sent.sid },
+    }).catch((err) => log.warn({ err }, 'cost record failed for outbound SMS'));
+  }
 
   await db
     .update(emailThreads)

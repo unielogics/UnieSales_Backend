@@ -26,13 +26,13 @@ import { registerFollowupRoutes } from './routes/followups.routes';
 import { registerDomainHealthRoutes } from './routes/domain-health.routes';
 import { registerTwilioRoutes } from './routes/twilio.routes';
 import { registerPublicIntakeRoutes } from './routes/public-intake.routes';
-import { registerPublicSalesIntakeRoutes } from './routes/public-sales-intake.routes';
 import { registerInboundLeadsRoutes } from './routes/inbound-leads.routes';
 import { registerSalesActivityRoutes } from './routes/sales-activity.routes';
 import { registerSalesTrainingRoutes } from './routes/sales-training.routes';
 import { registerBookingPageRoutes } from './routes/booking-pages.routes';
 import { registerNotificationRoutes } from './routes/notifications.routes';
 import { registerNotificationSettingsRoutes } from './routes/notification-settings.routes';
+import { registerCostRoutes } from './routes/cost.routes';
 import { isAllowedIntakeOrigin } from './config/intake-routing';
 import { isEnvelope, ok } from './services/response.service';
 // Side-effect import: augments FastifyRequest with user + workspace
@@ -48,6 +48,10 @@ async function main(): Promise<void> {
     disableRequestLogging: false,
     requestIdHeader: 'x-request-id',
     bodyLimit: 50 * 1024 * 1024, // 50MB — knowledge uploads
+    // The API runs behind Nginx in production. Without this, Fastify sees
+    // every browser as 127.0.0.1 and the global rate limiter buckets all users
+    // together, causing broad 429s during normal app startup.
+    trustProxy: true,
   });
 
   // Helmet — sane HTTP security defaults
@@ -79,11 +83,14 @@ async function main(): Promise<void> {
   // this parser to populate req.body for them.
   await app.register(formbody);
 
-  // Global rate limit: 600 req/min per IP. Tune later if abusive clients appear.
+  // Global rate limit for authenticated/product API traffic. Public intake and
+  // booking submission routes keep their stricter per-route limits below. CORS
+  // preflight requests are intentionally skipped because the frontend uses
+  // Authorization headers, which doubles request count otherwise.
   await app.register(rateLimit, {
-    max: 600,
+    max: 1200,
     timeWindow: '1 minute',
-    allowList: (req) => req.url === '/health',
+    allowList: (req) => req.url === '/health' || req.method === 'OPTIONS',
   });
 
   // Slow query log: warn on any handler taking longer than 1s.
@@ -131,13 +138,13 @@ async function main(): Promise<void> {
   await registerDomainHealthRoutes(app);
   await registerTwilioRoutes(app);
   await registerPublicIntakeRoutes(app);
-  await registerPublicSalesIntakeRoutes(app);
   await registerInboundLeadsRoutes(app);
   await registerSalesActivityRoutes(app);
   await registerSalesTrainingRoutes(app);
   await registerBookingPageRoutes(app);
   await registerNotificationRoutes(app);
   await registerNotificationSettingsRoutes(app);
+  await registerCostRoutes(app);
 
   app.get('/', async () => ok({ name: 'uniesales-api', version: '0.1.0' }));
 

@@ -10,6 +10,8 @@ import * as threadService from '../services/thread.service';
 import * as aiTasks from '../services/ai-tasks.service';
 import * as gmailService from '../services/gmail.service';
 import * as bookingPageService from '../services/booking-page.service';
+import * as activityService from '../services/sales-activity.service';
+import * as leadAiBriefService from '../services/lead-ai-brief.service';
 import { sendSmsToLead } from '../services/sms.service';
 import { ConflictError } from '../utils/errors';
 import { LEAD_STATUSES, type LeadStatus } from '../db/schema/leads';
@@ -30,6 +32,10 @@ const ListQuery = z.object({
   // only; `outbound` = CSV/Sheet/manual leads only; omitted = everything.
   origin: z.enum(['intake', 'outbound']).optional(),
 });
+const RelatedConversationsQuery = z.object({
+  sync: z.union([z.literal('true'), z.literal('1')]).optional(),
+  limit: z.coerce.number().int().positive().max(50).optional(),
+});
 
 const CreateSchema = z.object({
   email: z.string().email().max(254),
@@ -44,17 +50,29 @@ const CreateSchema = z.object({
   source: z.string().max(120).optional(),
   sourceNotes: z.string().optional(),
   status: z.string().optional(),
+  lifecycleStatus: z.enum(['active', 'paused', 'closed']).optional(),
+  pipelineStage: z.string().max(50).nullable().optional(),
+  aiOwner: z.boolean().optional(),
+  importOrigin: z.enum(['manual', 'upload', 'update', 'intake', 'sales_manual']).nullable().optional(),
 });
 
 const UpdateSchema = z.object({
   campaignId: z.string().uuid().optional(),
   companyName: z.string().max(200).nullable().optional(),
   contactName: z.string().max(200).nullable().optional(),
+  firstName: z.string().max(200).nullable().optional(),
+  lastName: z.string().max(200).nullable().optional(),
   title: z.string().max(200).nullable().optional(),
   website: z.string().max(500).nullable().optional(),
   phone: z.string().max(50).nullable().optional(),
   linkedinUrl: z.string().max(500).nullable().optional(),
+  city: z.string().max(120).nullable().optional(),
+  state: z.string().max(120).nullable().optional(),
+  streetAddress: z.string().max(300).nullable().optional(),
+  addressFull: z.string().max(500).nullable().optional(),
   segment: z.string().max(120).nullable().optional(),
+  source: z.string().max(120).nullable().optional(),
+  sourceUrl: z.string().max(500).nullable().optional(),
   status: z.string().optional(),
   leadScore: z.number().int().min(0).max(100).optional(),
   leadScoreReason: z.string().max(2000).optional(),
@@ -80,6 +98,23 @@ const CloseSchema = z.object({
   status: z.string().optional(),
 });
 const SuppressSchema = z.object({ reason: z.string().max(500).optional() });
+const LeadAiQuestionSchema = z.object({
+  id: z.string(),
+  question: z.string().min(1).max(220),
+  answer: z.string().max(1000).nullable().optional(),
+  priority: z.enum(['low', 'medium', 'high']).optional(),
+});
+const LeadAiBriefPatchSchema = z.object({
+  primaryProductProfileId: z.string().uuid().nullable().optional(),
+  relatedProductProfileIds: z.array(z.string().uuid()).max(6).optional(),
+  objective: z.string().max(1500).nullable().optional(),
+  operatorContext: z.string().max(4000).nullable().optional(),
+  constraints: z.string().max(2000).nullable().optional(),
+  nextStep: z.string().max(1200).nullable().optional(),
+  clarifyingQuestions: z.array(LeadAiQuestionSchema).max(5).optional(),
+});
+const ProductSuggestionPath = LeadPath.extend({ suggestionId: z.string().min(1).max(120) });
+const ProductSuggestionSchema = z.object({ status: z.enum(['approved', 'dismissed']) });
 
 function parseBody<T extends z.ZodTypeAny>(s: T, body: unknown): z.infer<T> {
   const r = s.safeParse(body);
@@ -213,13 +248,56 @@ export async function registerLeadRoutes(app: FastifyInstance): Promise<void> {
     return ok({ events });
   });
 
+  app.get(`${base}/:leadId/related-conversations`, { preHandler: READ }, async (req) => {
+    const { leadId } = parsePath(LeadPath, req.params);
+    const q = parseQuery(RelatedConversationsQuery, req.query);
+    let sync: Awaited<ReturnType<typeof gmailService.searchAndSyncThreadsByEmail>> | null = null;
+    if (q.sync != null) {
+      const lead = await leadService.getById(req.workspace!.id, leadId);
+      sync = await gmailService.searchAndSyncThreadsByEmail(req.workspace!.id, lead.email, 10);
+    }
+    const threads = await threadService.listRelatedByLeadEmail(
+      req.workspace!.id,
+      leadId,
+      q.limit ?? 25,
+    );
+    return ok({ threads, sync });
+  });
+
   app.patch(`${base}/:leadId`, { preHandler: WRITE }, async (req) => {
     const { leadId } = parsePath(LeadPath, req.params);
     const patch = parseBody(UpdateSchema, req.body);
+    const before = await leadService.getById(req.workspace!.id, leadId);
     const lead = await leadService.update(req.workspace!.id, leadId, {
       ...patch,
       status: patch.status as LeadStatus | undefined,
     });
+    if (patch.status && patch.status !== before.status) {
+      await activityService.emit({
+        workspaceId: req.workspace!.id,
+        leadId,
+        campaignId: lead.campaignId,
+        activityType: 'stage_changed',
+        title: 'Status changed',
+        description: `${before.status} → ${patch.status}`,
+        metadata: { from: before.status, to: patch.status, field: 'status' },
+        createdBy: req.user!.id,
+      });
+    }
+    if (patch.aiOwner != null && patch.aiOwner !== before.aiOwner) {
+      await activityService.emit({
+        workspaceId: req.workspace!.id,
+        leadId,
+        campaignId: lead.campaignId,
+        activityType: 'stage_changed',
+        title: patch.aiOwner ? 'AI enabled for lead' : 'AI disabled for lead',
+        description: patch.aiOwner
+          ? 'The AI can take actions for this lead again.'
+          : 'The AI will not take further automated actions for this lead.',
+        metadata: { from: before.aiOwner, to: patch.aiOwner, field: 'aiOwner' },
+        createdBy: req.user!.id,
+      });
+    }
     return ok({ lead }, 'Updated');
   });
 
@@ -380,6 +458,56 @@ export async function registerLeadRoutes(app: FastifyInstance): Promise<void> {
       lead.email,
     );
     return ok({ items });
+  });
+
+  // Lead-level AI Brief: operator-directed Sales follow-up control.
+  app.get(`${base}/:leadId/ai-brief`, { preHandler: READ }, async (req) => {
+    const { leadId } = parsePath(LeadPath, req.params);
+    const brief = await leadAiBriefService.getOrCreate(req.workspace!.id, leadId, req.user!.id);
+    return ok({ brief });
+  });
+
+  app.patch(`${base}/:leadId/ai-brief`, { preHandler: WRITE }, async (req) => {
+    const { leadId } = parsePath(LeadPath, req.params);
+    const patch = parseBody(LeadAiBriefPatchSchema, req.body ?? {});
+    const brief = await leadAiBriefService.patchBrief(req.workspace!.id, leadId, patch, req.user!.id);
+    return ok({ brief }, 'AI brief updated');
+  });
+
+  app.post(`${base}/:leadId/ai-brief/questions`, { preHandler: WRITE }, async (req) => {
+    const { leadId } = parsePath(LeadPath, req.params);
+    const brief = await leadAiBriefService.generateQuestions(req.workspace!.id, leadId);
+    return ok({ brief }, 'Clarifying questions generated');
+  });
+
+  app.post(`${base}/:leadId/ai-brief/product-suggestions`, { preHandler: WRITE }, async (req) => {
+    const { leadId } = parsePath(LeadPath, req.params);
+    const brief = await leadAiBriefService.generateProductSuggestions(req.workspace!.id, leadId);
+    return ok({ brief }, 'Product suggestions generated');
+  });
+
+  app.patch(`${base}/:leadId/ai-brief/product-suggestions/:suggestionId`, { preHandler: WRITE }, async (req) => {
+    const { leadId, suggestionId } = parsePath(ProductSuggestionPath, req.params);
+    const body = parseBody(ProductSuggestionSchema, req.body ?? {});
+    const brief = await leadAiBriefService.updateProductSuggestion(
+      req.workspace!.id,
+      leadId,
+      suggestionId,
+      body.status,
+    );
+    return ok({ brief }, 'Product suggestion updated');
+  });
+
+  app.post(`${base}/:leadId/ai-brief/draft`, { preHandler: WRITE }, async (req) => {
+    const { leadId } = parsePath(LeadPath, req.params);
+    const result = await leadAiBriefService.generateFirstDraft(req.workspace!.id, leadId);
+    return ok(result, 'First message drafted');
+  });
+
+  app.post(`${base}/:leadId/ai-brief/approve-start`, { preHandler: WRITE }, async (req) => {
+    const { leadId } = parsePath(LeadPath, req.params);
+    const brief = await leadAiBriefService.approveStart(req.workspace!.id, leadId);
+    return ok({ brief }, 'AI follow-up started');
   });
 
   // ---- Workspace-level suppression list ----

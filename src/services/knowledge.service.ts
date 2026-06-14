@@ -9,6 +9,7 @@ import {
 } from '../db/schema/campaign-knowledge-files';
 import { knowledgeKey, putObject, s3UriFor, deleteObject } from './s3.service';
 import { NotFoundError, ValidationError } from '../utils/errors';
+import { recordCostEvent } from './cost.service';
 
 export async function list(workspaceId: string, campaignId: string): Promise<CampaignKnowledgeFile[]> {
   const db = getDb();
@@ -82,7 +83,40 @@ export async function uploadFile(
       extractionStatus: 'pending',
     } as NewCampaignKnowledgeFile)
     .returning();
-  return rows[0]!;
+  const file = rows[0]!;
+  await Promise.all([
+    recordCostEvent({
+      workspaceId,
+      campaignId,
+      sourceObjectType: 'campaign_knowledge_file',
+      sourceObjectId: file.id,
+      dedupeKey: `knowledge:${file.id}:put_object`,
+      provider: 'aws',
+      service: 's3',
+      category: 'storage',
+      actionType: 'put_object',
+      quantity: 1,
+      unit: 'request',
+      costSource: 'estimated',
+      metadata: { fileName: input.fileName, bytes: input.buffer.length, key },
+    }),
+    recordCostEvent({
+      workspaceId,
+      campaignId,
+      sourceObjectType: 'campaign_knowledge_file',
+      sourceObjectId: file.id,
+      dedupeKey: `knowledge:${file.id}:storage_gb_month_estimate`,
+      provider: 'aws',
+      service: 's3',
+      category: 'storage',
+      actionType: 'storage_gb_month_estimate',
+      quantity: input.buffer.length / 1024 / 1024 / 1024,
+      unit: 'gb_month',
+      costSource: 'estimated',
+      metadata: { fileName: input.fileName, bytes: input.buffer.length, key },
+    }),
+  ]).catch((err) => console.warn('[cost.knowledge.uploadFile] record failed', err));
+  return file;
 }
 
 export async function pasteNotes(

@@ -13,6 +13,7 @@ import { leads } from '../db/schema/leads';
 import { suppressionList } from '../db/schema/suppression-list';
 import { knowledgeKey, putObject, getObjectBuffer, s3UriFor } from './s3.service';
 import { NotFoundError, ValidationError, ConflictError } from '../utils/errors';
+import { recordCostEvent } from './cost.service';
 
 // ---- Field mapping ----
 
@@ -240,12 +241,45 @@ export async function createCsv(
     contentType: inferredCt,
     metadata: { workspace_id: workspaceId, campaign_id: campaignId, kind: 'lead_source_csv' },
   });
-  return insertSource(workspaceId, campaignId, {
+  const source = await insertSource(workspaceId, campaignId, {
     sourceType: 'csv_upload',
     sourceName: input.sourceName ?? input.fileName,
     uploadedFileUrl: s3UriFor(key),
     fieldMapping: input.fieldMapping ?? null,
   });
+  await Promise.all([
+    recordCostEvent({
+      workspaceId,
+      campaignId,
+      sourceObjectType: 'campaign_lead_source',
+      sourceObjectId: source.id,
+      dedupeKey: `lead_source:${source.id}:put_object`,
+      provider: 'aws',
+      service: 's3',
+      category: 'storage',
+      actionType: 'put_object',
+      quantity: 1,
+      unit: 'request',
+      costSource: 'estimated',
+      metadata: { fileName: input.fileName, bytes: input.buffer.length, key },
+    }),
+    recordCostEvent({
+      workspaceId,
+      campaignId,
+      sourceObjectType: 'campaign_lead_source',
+      sourceObjectId: source.id,
+      dedupeKey: `lead_source:${source.id}:storage_gb_month_estimate`,
+      provider: 'aws',
+      service: 's3',
+      category: 'storage',
+      actionType: 'storage_gb_month_estimate',
+      quantity: input.buffer.length / 1024 / 1024 / 1024,
+      unit: 'gb_month',
+      costSource: 'estimated',
+      metadata: { fileName: input.fileName, bytes: input.buffer.length, key },
+    }),
+  ]).catch((err) => console.warn('[cost.leadSource.createCsv] record failed', err));
+  return source;
 }
 
 export async function createManual(

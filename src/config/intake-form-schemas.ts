@@ -566,6 +566,55 @@ export const INTAKE_FORM_SCHEMAS: Record<string, IntakeFormSchema> = {
     ],
     exampleContact: EXAMPLE_3PL,
   },
+
+  'uniecortex.website_catalog_audit': {
+    site: 'uniecortex',
+    tag: 'website_catalog_audit',
+    displayName: 'UnieConnect — Catalog Audit (Cortex mirror)',
+    publicUrl: 'https://uniecortex.com/catalog-audit',
+    serverToServer: true,
+    contactFields: [F.name(), F.email(), F.phone(false), F.company(), F.title(false)],
+    customFields: [
+      {
+        name: 'cortex_reference',
+        label: 'Cortex reference',
+        type: 'text',
+        required: true,
+        example: 'cat_audit_01JZ9Q9Q4G6DP',
+      },
+      {
+        name: 'confidence',
+        label: 'Confidence',
+        type: 'text',
+        example: '0.86',
+      },
+      {
+        name: 'product_count',
+        label: 'Product count',
+        type: 'number',
+        example: '184',
+      },
+      {
+        name: 'blockers',
+        label: 'Blockers',
+        type: 'textarea',
+        example: 'missing GTINs, duplicate SKUs, incomplete dimensions',
+      },
+      {
+        name: 'savings',
+        label: 'Estimated savings',
+        type: 'text',
+        example: '$14,200 annual parcel savings',
+      },
+      {
+        name: 'next_actions',
+        label: 'Next actions',
+        type: 'textarea',
+        example: 'Clean SKU metadata, normalize variants, run carrier/service mapping.',
+      },
+    ],
+    exampleContact: EXAMPLE_SHIPPER,
+  },
 };
 
 /**

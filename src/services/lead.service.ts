@@ -22,8 +22,8 @@ export interface LeadFilters {
   orderDir?: 'asc' | 'desc';
   /**
    * Sales-vs-Campaigns mode isolation:
-   *  - 'intake'   → only inbound public-form leads (import_origin = 'intake')
-   *  - 'outbound' → only campaign-imported leads (import_origin IN ('upload','update') OR NULL)
+   *  - 'intake'   → Sales leads (public intake + manually enrolled Sales leads)
+   *  - 'outbound' → Campaign leads (everything outside Sales)
    *  - undefined  → no origin filter (returns everything)
    * The frontend passes 'intake' from Sales-mode pages and 'outbound' from
    * Campaigns-mode pages so the two worlds never bleed into each other.
@@ -50,12 +50,12 @@ function buildWhere(workspaceId: string, f: LeadFilters): SQL | undefined {
     );
   }
   if (f.origin === 'intake') {
-    conds.push(eq(leads.importOrigin, 'intake'));
+    conds.push(inArray(leads.importOrigin, ['intake', 'sales_manual']));
   } else if (f.origin === 'outbound') {
-    // Outbound = anything that didn't come through the public intake API.
+    // Outbound = anything outside the Sales system.
     // Includes CSV/Sheet imports ('upload', 'update') AND nulls (manual /
     // pre-Layer-1 legacy leads).
-    conds.push(sql`(${leads.importOrigin} IS NULL OR ${leads.importOrigin} <> 'intake')`);
+    conds.push(sql`(${leads.importOrigin} IS NULL OR ${leads.importOrigin} NOT IN ('intake', 'sales_manual'))`);
   }
   return conds.length === 1 ? conds[0] : and(...conds);
 }
@@ -128,11 +128,15 @@ export interface CreateLeadInput {
   sourceNotes?: string;
   status?: LeadStatus;
   /**
-   * Discriminator for Sales-vs-Campaigns isolation. Manual UI creates leave
-   * this undefined → defaults to 'manual' which keeps them out of Sales-mode
-   * filters. Intake-API leads come in as 'intake' from intake.service.
+   * Discriminator for Sales-vs-Campaigns isolation. Campaign manual creates
+   * leave this undefined → defaults to 'manual'. Sales manual creates pass
+   * 'sales_manual' so they appear in Sales-mode filters without pretending to
+   * be public form submissions.
    */
-  importOrigin?: 'manual' | 'upload' | 'update' | 'intake' | null;
+  importOrigin?: 'manual' | 'upload' | 'update' | 'intake' | 'sales_manual' | null;
+  lifecycleStatus?: 'active' | 'paused' | 'closed';
+  pipelineStage?: string | null;
+  aiOwner?: boolean;
 }
 
 export async function create(workspaceId: string, input: CreateLeadInput): Promise<Lead> {
@@ -162,9 +166,9 @@ export async function create(workspaceId: string, input: CreateLeadInput): Promi
         source: input.source ?? 'manual',
         sourceNotes: input.sourceNotes ?? null,
         status: input.status ?? 'new',
-        // Manual creation is outbound by definition. The intake API sets this
-        // to 'intake' through its own code path. Setting it explicitly keeps
-        // manual leads OUT of Sales-mode filters that match on import_origin.
+        lifecycleStatus: input.lifecycleStatus ?? 'active',
+        pipelineStage: input.pipelineStage ?? null,
+        aiOwner: input.aiOwner ?? true,
         importOrigin: input.importOrigin ?? 'manual',
       } as NewLead)
       .returning();
@@ -186,11 +190,19 @@ export interface UpdateLeadInput {
   email?: string;
   companyName?: string | null;
   contactName?: string | null;
+  firstName?: string | null;
+  lastName?: string | null;
   title?: string | null;
   website?: string | null;
   phone?: string | null;
   linkedinUrl?: string | null;
+  city?: string | null;
+  state?: string | null;
+  streetAddress?: string | null;
+  addressFull?: string | null;
   segment?: string | null;
+  source?: string | null;
+  sourceUrl?: string | null;
   status?: LeadStatus;
   leadScore?: number;
   leadScoreReason?: string;

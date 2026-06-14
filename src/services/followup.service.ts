@@ -18,6 +18,7 @@ import { sendEmail } from './gmail.service';
 import { sendSmsToLead, toE164 } from './sms.service';
 import { getCalendarConfig } from './calendar.service';
 import { activateScheduledCampaigns } from './campaign.service';
+import { runDueBriefFollowups } from './lead-ai-brief.service';
 import { createLogger } from '../config/logger';
 import { ConflictError } from '../utils/errors';
 
@@ -259,12 +260,15 @@ export async function runFollowups(opts: { workspaceId?: string; limit?: number 
   }
   const coldQueued = await queueColdStart(opts.workspaceId);
 
+  const briefStats = await runDueBriefFollowups({ workspaceId: opts.workspaceId, limit });
+
   const conds = [
     eq(leads.lifecycleStatus, 'active'),
     eq(leads.aiOwner, true),
     isNotNull(leads.nextActionAt),
     lte(leads.nextActionAt, new Date()),
     isNotNull(leads.campaignId),
+    sql`${leads.status} <> 'interested'`,
     // Belt-and-suspenders to mirror the queueColdStart filter. Even if a stale
     // test-send lead still has a next_action_at from before the fix, never
     // re-send to it via the worker.
@@ -281,7 +285,13 @@ export async function runFollowups(opts: { workspaceId?: string; limit?: number 
     .where(and(...conds))
     .limit(limit);
 
-  const stats: FollowupRunStats = { scanned: dueLeads.length, sent: 0, blocked: 0, errors: 0, coldQueued };
+  const stats: FollowupRunStats = {
+    scanned: dueLeads.length + briefStats.scanned,
+    sent: briefStats.sent,
+    blocked: briefStats.blocked,
+    errors: briefStats.errors,
+    coldQueued,
+  };
 
   for (const lead of dueLeads) {
     try {

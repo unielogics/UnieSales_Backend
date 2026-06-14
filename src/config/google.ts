@@ -23,6 +23,10 @@ export const GOOGLE_OAUTH_SCOPES = [
   // Calendar — read + write events so the AI can book meetings
   'https://www.googleapis.com/auth/calendar',
   'https://www.googleapis.com/auth/calendar.events',
+  // Meet artifacts — best-effort transcript / smart-notes enrichment for
+  // post-call logging. Existing connected accounts must reconnect to grant it.
+  'https://www.googleapis.com/auth/meetings.space.readonly',
+  'https://www.googleapis.com/auth/documents.readonly',
   // Drive — list user's files (metadata only) so the Lead Source picker can
   // show their existing sheets, plus access to files the app creates/opens
   'https://www.googleapis.com/auth/drive.metadata.readonly',

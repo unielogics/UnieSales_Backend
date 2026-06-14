@@ -35,12 +35,33 @@ export const calendarEvents = pgTable(
     // app | google | ai_booked
     source: text('source').notNull().default('app'),
 
+    // Post-call hygiene. These fields drive the cross-device outcome prompt.
+    outcomeStatus: text('outcome_status').notNull().default('pending'),
+    meetingOutcome: text('meeting_outcome'),
+    outcomeReason: text('outcome_reason'),
+    outcomeNotes: text('outcome_notes'),
+    outcomeNextAction: text('outcome_next_action'),
+    outcomeLoggedAt: timestamp('outcome_logged_at', { withTimezone: false }),
+    outcomeLoggedByUserId: uuid('outcome_logged_by_user_id'),
+    outcomeSnoozedUntil: timestamp('outcome_snoozed_until', { withTimezone: false }),
+    outcomeTaskId: uuid('outcome_task_id'),
+    nextStepTaskId: uuid('next_step_task_id'),
+    nextStepCalendarEventId: uuid('next_step_calendar_event_id'),
+
+    meetConferenceRecord: text('meet_conference_record'),
+    meetArtifactStatus: text('meet_artifact_status'),
+    meetTranscriptText: text('meet_transcript_text'),
+    meetNotesText: text('meet_notes_text'),
+    meetArtifactSyncedAt: timestamp('meet_artifact_synced_at', { withTimezone: false }),
+    meetArtifactError: text('meet_artifact_error'),
+
     createdAt: timestamp('created_at', { withTimezone: false }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: false }).notNull().defaultNow(),
   },
   (t) => ({
     workspaceIdx: index('calendar_events_workspace_idx').on(t.workspaceId),
     workspaceStartIdx: index('calendar_events_workspace_start_idx').on(t.workspaceId, t.startAt),
+    workspaceOutcomeIdx: index('calendar_events_workspace_outcome_idx').on(t.workspaceId, t.endAt, t.outcomeLoggedAt),
     googleUnique: uniqueIndex('calendar_events_google_unique').on(t.gmailAccountId, t.googleEventId),
   }),
 );

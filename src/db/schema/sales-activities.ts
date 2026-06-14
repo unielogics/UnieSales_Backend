@@ -66,5 +66,6 @@ export const SALES_ACTIVITY_TYPES = [
   'email_drafted',
   'email_sent',
   'lead_closed',
+  'meeting_outcome_logged',
 ] as const;
 export type SalesActivityType = (typeof SALES_ACTIVITY_TYPES)[number];

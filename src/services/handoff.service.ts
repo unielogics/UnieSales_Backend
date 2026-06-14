@@ -7,7 +7,7 @@
  * 'continue' resumes the AI, 'closed' closes the lead. This keeps the lead and
  * the handoff record in lockstep so nothing is left dangling.
  */
-import { and, desc, eq, ne, isNull, or, sql } from 'drizzle-orm';
+import { and, desc, eq, ne, inArray, isNull, or, sql } from 'drizzle-orm';
 import { getDb } from '../config/db';
 import { handoffs, type Handoff, type HandoffStatus, HANDOFF_STATUSES } from '../db/schema/handoffs';
 import { leads, type Lead } from '../db/schema/leads';
@@ -39,9 +39,9 @@ export async function list(
   // Handoffs without a linked lead (rare — only AI-system-internal) are
   // treated as outbound (the legacy default).
   if (opts.origin === 'intake') {
-    conds.push(eq(leads.importOrigin, 'intake'));
+    conds.push(inArray(leads.importOrigin, ['intake', 'sales_manual']));
   } else if (opts.origin === 'outbound') {
-    conds.push(or(isNull(leads.importOrigin), ne(leads.importOrigin, 'intake'))!);
+    conds.push(or(isNull(leads.importOrigin), sql`${leads.importOrigin} NOT IN ('intake', 'sales_manual')`)!);
   }
 
   const rows = await db

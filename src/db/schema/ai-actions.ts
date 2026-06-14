@@ -71,6 +71,12 @@ export const AI_ACTION_TYPES = [
   // cost + audit one row per lead even when the runner fans out to multiple
   // sub-tasks. Score / classify / etc. still get their own rows too.
   'intake_post_process',
+  // Lead-level Sales AI brief tasks. These use the light model by default and
+  // are attributed separately in the cost dashboard.
+  'lead_brief_questions',
+  'lead_brief_draft',
+  'lead_brief_followup',
+  'lead_product_suggestions',
 ] as const;
 export type AiActionType = (typeof AI_ACTION_TYPES)[number];
 

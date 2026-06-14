@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNotNull, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, ilike, inArray, isNotNull, or, sql } from 'drizzle-orm';
 import { getDb } from '../config/db';
 import { emailThreads, type EmailThread } from '../db/schema/email-threads';
 import { emailMessages, type EmailMessage } from '../db/schema/email-messages';
@@ -23,7 +23,7 @@ export async function list(
     /**
      * Sales-vs-Campaigns mode isolation:
      *  - 'intake'   → only threads tied to leads with import_origin='intake'
-     *  - 'outbound' → only threads tied to leads with import_origin <> 'intake' (or null)
+   *  - 'outbound' → only threads tied to non-Sales leads (or null)
      *  - undefined  → no origin filter
      */
     origin?: 'intake' | 'outbound';
@@ -61,7 +61,7 @@ export async function list(
     const intakeLeadIds = db
       .select({ id: leads.id })
       .from(leads)
-      .where(and(eq(leads.workspaceId, workspaceId), eq(leads.importOrigin, 'intake')));
+      .where(and(eq(leads.workspaceId, workspaceId), inArray(leads.importOrigin, ['intake', 'sales_manual'])));
     conds.push(inArray(emailThreads.leadId, intakeLeadIds));
   } else if (opts.origin === 'outbound') {
     const outboundLeadIds = db
@@ -70,7 +70,7 @@ export async function list(
       .where(
         and(
           eq(leads.workspaceId, workspaceId),
-          sql`(${leads.importOrigin} IS NULL OR ${leads.importOrigin} <> 'intake')`,
+          sql`(${leads.importOrigin} IS NULL OR ${leads.importOrigin} NOT IN ('intake', 'sales_manual'))`,
         ),
       );
     conds.push(inArray(emailThreads.leadId, outboundLeadIds));
@@ -139,6 +139,82 @@ export async function listByLead(workspaceId: string, leadId: string): Promise<(
     .select()
     .from(emailMessages)
     .where(and(eq(emailMessages.workspaceId, workspaceId), eq(emailMessages.leadId, leadId)))
+    .orderBy(asc(emailMessages.createdAt));
+
+  return threads.map((t) => ({
+    ...t,
+    messages: msgs.filter((m) => m.emailThreadId === t.id),
+  }));
+}
+
+/**
+ * Other conversations for a lead file: threads involving the same email
+ * address, including threads attached to duplicate/older lead records or
+ * matched by message participants. Excludes the current lead's own threads so
+ * the LeadDetail conversation panel does not duplicate itself.
+ */
+export async function listRelatedByLeadEmail(
+  workspaceId: string,
+  leadId: string,
+  limit = 25,
+): Promise<(EmailThread & { messages: EmailMessage[] })[]> {
+  const db = getDb();
+  const leadRows = await db
+    .select({ email: leads.email })
+    .from(leads)
+    .where(and(eq(leads.workspaceId, workspaceId), eq(leads.id, leadId)))
+    .limit(1);
+  const email = leadRows[0]?.email?.trim().toLowerCase();
+  if (!email) return [];
+
+  const sameEmailLeads = await db
+    .select({ id: leads.id })
+    .from(leads)
+    .where(and(eq(leads.workspaceId, workspaceId), ilike(leads.email, email)));
+  const sameEmailLeadIds = sameEmailLeads.map((l) => l.id);
+
+  const like = `%${email}%`;
+  const participantMessages = await db
+    .select({ threadId: emailMessages.emailThreadId })
+    .from(emailMessages)
+    .where(
+      and(
+        eq(emailMessages.workspaceId, workspaceId),
+        sql`${emailMessages.emailThreadId} IS NOT NULL`,
+        sql`(${emailMessages.fromEmail} ILIKE ${like} OR ${emailMessages.toEmail} ILIKE ${like})`,
+      ),
+    )
+    .limit(250);
+  const participantThreadIds = participantMessages
+    .map((m) => m.threadId)
+    .filter((id): id is string => !!id);
+
+  const matchConds = [];
+  if (sameEmailLeadIds.length > 0) {
+    matchConds.push(inArray(emailThreads.leadId, sameEmailLeadIds));
+  }
+  if (participantThreadIds.length > 0) {
+    matchConds.push(inArray(emailThreads.id, participantThreadIds));
+  }
+  const threadIds = new Set<string>();
+  const candidateRows =
+    matchConds.length > 0
+      ? await db
+          .select()
+          .from(emailThreads)
+          .where(and(eq(emailThreads.workspaceId, workspaceId), or(...matchConds)!))
+          .orderBy(desc(emailThreads.updatedAt))
+          .limit(Math.min(Math.max(limit, 1), 50))
+      : [];
+
+  const threads = candidateRows;
+  for (const t of threads) threadIds.add(t.id);
+  if (threadIds.size === 0) return [];
+
+  const msgs = await db
+    .select()
+    .from(emailMessages)
+    .where(and(eq(emailMessages.workspaceId, workspaceId), inArray(emailMessages.emailThreadId, [...threadIds])))
     .orderBy(asc(emailMessages.createdAt));
 
   return threads.map((t) => ({

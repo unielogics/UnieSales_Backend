@@ -1,5 +1,6 @@
 import { pgTable, uuid, text, boolean, integer, timestamp, index, uniqueIndex } from 'drizzle-orm/pg-core';
 import { workspaces } from './workspaces';
+import { users } from './users';
 
 export const gmailAccounts = pgTable(
   'gmail_accounts',
@@ -10,6 +11,7 @@ export const gmailAccounts = pgTable(
     email: text('email').notNull(),
     senderName: text('sender_name'),
     googleUserId: text('google_user_id'),
+    connectedByUserId: uuid('connected_by_user_id').references(() => users.id),
 
     accessTokenEncrypted: text('access_token_encrypted'),
     refreshTokenEncrypted: text('refresh_token_encrypted'),
@@ -37,6 +39,7 @@ export const gmailAccounts = pgTable(
     workspaceIdx: index('gmail_accounts_workspace_idx').on(t.workspaceId),
     workspaceEmailUnique: uniqueIndex('gmail_accounts_workspace_email_unique').on(t.workspaceId, t.email),
     activeIdx: index('gmail_accounts_active_idx').on(t.isActive),
+    connectedByIdx: index('gmail_accounts_connected_by_idx').on(t.connectedByUserId),
   }),
 );
 

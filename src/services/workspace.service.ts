@@ -148,7 +148,7 @@ export async function dashboard(workspaceId: string): Promise<DashboardSummary> 
     .select({ id: leads.id })
     .from(leads)
     .where(
-      sql`workspace_id = ${workspaceId} AND (import_origin IS NULL OR import_origin <> 'intake')`,
+      sql`workspace_id = ${workspaceId} AND (import_origin IS NULL OR import_origin NOT IN ('intake', 'sales_manual'))`,
     );
 
   const [aiPending] = await db
@@ -168,7 +168,7 @@ export async function dashboard(workspaceId: string): Promise<DashboardSummary> 
     .select({ n: sql<number>`count(*)::int` })
     .from(leads)
     .where(
-      sql`workspace_id = ${workspaceId} AND lifecycle_status = 'active' AND ai_owner = true AND next_action_at IS NOT NULL AND (import_origin IS NULL OR import_origin <> 'intake')`,
+      sql`workspace_id = ${workspaceId} AND lifecycle_status = 'active' AND ai_owner = true AND next_action_at IS NOT NULL AND (import_origin IS NULL OR import_origin NOT IN ('intake', 'sales_manual'))`,
     );
 
   // Send volume in last 7 days + handoff queue depth + recent thread activity
@@ -192,7 +192,7 @@ export async function dashboard(workspaceId: string): Promise<DashboardSummary> 
       and(
         eq(leads.workspaceId, workspaceId),
         eq(leads.status, 'handoff_required'),
-        sql`(${leads.importOrigin} IS NULL OR ${leads.importOrigin} <> 'intake')`,
+        sql`(${leads.importOrigin} IS NULL OR ${leads.importOrigin} NOT IN ('intake', 'sales_manual'))`,
       ),
     );
   // Real replies: distinct outbound leads that sent an inbound message in the
@@ -203,7 +203,7 @@ export async function dashboard(workspaceId: string): Promise<DashboardSummary> 
     .select({ n: sql<number>`count(distinct em.lead_id)::int` })
     .from(sql`email_messages em JOIN leads l ON l.id = em.lead_id`)
     .where(
-      sql`em.workspace_id = ${workspaceId} AND em.direction = 'inbound' AND em.lead_id IS NOT NULL AND em.created_at >= NOW() - INTERVAL '7 days' AND (l.import_origin IS NULL OR l.import_origin <> 'intake')`,
+      sql`em.workspace_id = ${workspaceId} AND em.direction = 'inbound' AND em.lead_id IS NOT NULL AND em.created_at >= NOW() - INTERVAL '7 days' AND (l.import_origin IS NULL OR l.import_origin NOT IN ('intake', 'sales_manual'))`,
     );
 
   // New leads created today, split by how they entered (upload vs refresh).

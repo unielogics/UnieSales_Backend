@@ -10,6 +10,7 @@ import { modelFor } from './ai-router.service';
 import { sendEmail } from './gmail.service';
 import * as threadService from './thread.service';
 import { sendSmsToLead } from './sms.service';
+import { recordAiTokenCosts } from './cost.service';
 
 const SYSTEM_PROMPT = `You are the AI Sales Operator for a multi-workspace outbound + nurture platform.
 
@@ -36,6 +37,11 @@ interface RunActionInput<T> {
   /** JSON schema sent to Anthropic for structured output. */
   jsonSchema: Record<string, unknown>;
   forceHeavy?: boolean;
+  contextExtras?: {
+    stable?: Record<string, unknown>;
+    volatile?: Record<string, unknown>;
+  };
+  costMetadata?: Record<string, unknown>;
 }
 
 export interface AiActionResult<T> {
@@ -88,6 +94,12 @@ export async function runAction<T>(input: RunActionInput<T>): Promise<AiActionRe
     const model = modelFor(input.actionType, input.forceHeavy);
     const anthropic = getAnthropic();
     const { stable, volatile } = splitContext(context);
+    const stableContext = input.contextExtras?.stable
+      ? { ...stable, lead_ai_brief_stable: input.contextExtras.stable }
+      : stable;
+    const volatileContext = input.contextExtras?.volatile
+      ? { ...volatile, lead_ai_brief: input.contextExtras.volatile }
+      : volatile;
 
     const response = await anthropic.messages.create({
       model,
@@ -103,14 +115,14 @@ export async function runAction<T>(input: RunActionInput<T>): Promise<AiActionRe
         },
         {
           type: 'text',
-          text: `## Campaign & product context\n\n${JSON.stringify(stable)}`,
+          text: `## Campaign & product context\n\n${JSON.stringify(stableContext)}`,
           cache_control: { type: 'ephemeral' },
         },
       ],
       messages: [
         {
           role: 'user',
-          content: `## Lead & conversation\n\n${JSON.stringify(volatile)}`,
+          content: `## Lead & conversation\n\n${JSON.stringify(volatileContext)}`,
         },
       ],
     });
@@ -166,6 +178,25 @@ export async function runAction<T>(input: RunActionInput<T>): Promise<AiActionRe
       .where(eq(aiActions.id, pending.id))
       .returning();
 
+    if (updated) {
+      await recordAiTokenCosts({
+        workspaceId: input.workspaceId,
+        campaignId: input.campaignId,
+        leadId: input.leadId,
+        emailThreadId: input.threadId,
+        aiActionId: updated.id,
+        actionType: input.actionType,
+        service: model,
+        inputTokens: usage?.input_tokens ?? null,
+        outputTokens: usage?.output_tokens ?? null,
+        cacheReadTokens: usage?.cache_read_input_tokens ?? null,
+        cacheCreationTokens: usage?.cache_creation_input_tokens ?? null,
+        occurredAt: updated.completedAt ?? new Date(),
+        costSource: 'estimated',
+        metadata: input.costMetadata,
+      });
+    }
+
     return { action: updated!, output, confidence };
   } catch (err) {
     await db
@@ -218,7 +249,7 @@ export async function listQueue(
     const intakeLeads = db
       .select({ id: leads.id })
       .from(leads)
-      .where(and(eq(leads.workspaceId, workspaceId), eq(leads.importOrigin, 'intake')));
+      .where(and(eq(leads.workspaceId, workspaceId), inArray(leads.importOrigin, ['intake', 'sales_manual'])));
     conds.push(inArray(aiActions.leadId, intakeLeads));
   } else if (opts.origin === 'outbound') {
     const outboundLeads = db
@@ -227,7 +258,7 @@ export async function listQueue(
       .where(
         and(
           eq(leads.workspaceId, workspaceId),
-          or(isNull(leads.importOrigin), ne(leads.importOrigin, 'intake'))!,
+          or(isNull(leads.importOrigin), sql`${leads.importOrigin} NOT IN ('intake', 'sales_manual')`)!,
         ),
       );
     // Actions with no lead OR whose lead is non-intake — both belong to outbound.
@@ -270,6 +301,8 @@ export interface PlannedAction {
 
 function stageLabelFromStatus(status: string): string {
   switch (status) {
+    case 'interested':
+      return 'AI brief follow-up';
     case 'sent_email_1':
       return 'Follow-up 1';
     case 'sent_followup_1':
@@ -303,9 +336,9 @@ export async function listPlanned(
   // Origin filter for the lead-level query (#1) below.
   const leadOriginCond =
     opts.origin === 'intake'
-      ? eq(leads.importOrigin, 'intake')
+      ? inArray(leads.importOrigin, ['intake', 'sales_manual'])
       : opts.origin === 'outbound'
-        ? or(isNull(leads.importOrigin), ne(leads.importOrigin, 'intake'))!
+        ? or(isNull(leads.importOrigin), sql`${leads.importOrigin} NOT IN ('intake', 'sales_manual')`)!
         : undefined;
 
   // 1. Scheduled sends — leads the followup worker will contact.
@@ -354,10 +387,10 @@ export async function listPlanned(
   // Origin filter on the joined lead. Actions without a lead are treated as
   // outbound (legacy default).
   if (opts.origin === 'intake') {
-    queuedConds.push(eq(leads.importOrigin, 'intake'));
+    queuedConds.push(inArray(leads.importOrigin, ['intake', 'sales_manual']));
   } else if (opts.origin === 'outbound') {
     queuedConds.push(
-      or(isNull(leads.id), isNull(leads.importOrigin), ne(leads.importOrigin, 'intake'))!,
+      or(isNull(leads.id), isNull(leads.importOrigin), sql`${leads.importOrigin} NOT IN ('intake', 'sales_manual')`)!,
     );
   }
   const queued = await db

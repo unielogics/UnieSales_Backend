@@ -34,6 +34,10 @@ export const salesTasks = pgTable(
 
     createdAt: timestamp('created_at', { withTimezone: false }).notNull().defaultNow(),
     completedAt: timestamp('completed_at', { withTimezone: false }),
+
+    // Set when the notifications worker has pushed a "task due" alert, so we
+    // don't re-notify the same task every tick.
+    dueNotifiedAt: timestamp('due_notified_at', { withTimezone: false }),
   },
   (t) => ({
     workspaceStatusIdx: index('sales_tasks_workspace_status_idx').on(t.workspaceId, t.status),
@@ -56,6 +60,7 @@ export const SALES_TASK_TYPES = [
   'request_missing_info',
   'follow_up_manual',
   'review_form_submission',
+  'post_call_outcome',
   // Used by the post-intake runner when the matching Sales Training profile
   // is disabled — the AI defers to the operator instead of drafting a reply.
   'human_handoff',

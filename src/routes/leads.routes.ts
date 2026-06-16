@@ -73,6 +73,16 @@ const BulkSchema = z.object({
   leadIds: z.array(z.string().uuid()).min(1).max(500),
   patch: UpdateSchema,
 });
+const BulkLeadIdsSchema = z.object({
+  leadIds: z.array(z.string().uuid()).min(1).max(500),
+});
+const MoveLeadsSchema = z.object({
+  leadIds: z.array(z.string().uuid()).min(1).max(500),
+  targetMode: z.enum(['sales', 'campaign']),
+  targetWorkspaceId: z.string().uuid().optional(),
+  targetCampaignId: z.string().uuid().optional(),
+  archiveSource: z.literal(true).optional().default(true),
+});
 
 const PauseSchema = z.object({ pausedUntil: z.string().datetime().optional() });
 const CloseSchema = z.object({
@@ -163,22 +173,36 @@ export async function registerLeadRoutes(app: FastifyInstance): Promise<void> {
   // Soft-delete a batch of leads. Sets deleted_at + flips aiOwner off so
   // every UI surface and every worker stops touching them. Idempotent.
   app.post(`${base}/bulk-delete`, { preHandler: WRITE }, async (req) => {
-    const input = parseBody(
-      z.object({ leadIds: z.array(z.string().uuid()).min(1).max(500) }),
-      req.body,
-    );
+    const input = parseBody(BulkLeadIdsSchema, req.body);
     const r = await leadService.bulkSoftDelete(req.workspace!.id, input.leadIds);
     return ok(r, `${r.deleted} leads deleted`);
+  });
+
+  // Permanently delete lead files. Linked operational rows are removed,
+  // reporting/history rows are detached, then the lead rows are deleted.
+  app.post(`${base}/bulk-permanent-delete`, { preHandler: WRITE }, async (req) => {
+    const input = parseBody(BulkLeadIdsSchema, req.body);
+    const r = await leadService.bulkPermanentDelete(req.workspace!.id, input.leadIds);
+    return ok(r, `${r.deleted} leads permanently deleted`);
+  });
+
+  app.post(`${base}/move`, { preHandler: WRITE }, async (req) => {
+    const input = parseBody(MoveLeadsSchema, req.body);
+    const r = await leadService.moveLeads(req.workspace!.id, {
+      leadIds: input.leadIds,
+      targetMode: input.targetMode,
+      targetWorkspaceId: input.targetWorkspaceId,
+      targetCampaignId: input.targetCampaignId,
+      userId: req.user!.id,
+    });
+    return ok(r, `${r.moved} leads moved`);
   });
 
   // Cancel a batch of scheduled outbound sends. Backs the AI Queue's
   // "Scheduled to send" delete affordance — clears next_action_at so the
   // followup worker stops picking these leads up. Lead survives.
   app.post(`${base}/bulk-cancel-scheduled`, { preHandler: WRITE }, async (req) => {
-    const input = parseBody(
-      z.object({ leadIds: z.array(z.string().uuid()).min(1).max(500) }),
-      req.body,
-    );
+    const input = parseBody(BulkLeadIdsSchema, req.body);
     const r = await leadService.bulkCancelScheduled(req.workspace!.id, input.leadIds);
     return ok(r, `${r.cancelled} sends cancelled`);
   });
@@ -186,10 +210,7 @@ export async function registerLeadRoutes(app: FastifyInstance): Promise<void> {
   // Restore previously soft-deleted leads. No UI hook yet; here for recovery
   // via curl if the operator deletes by mistake.
   app.post(`${base}/bulk-restore`, { preHandler: WRITE }, async (req) => {
-    const input = parseBody(
-      z.object({ leadIds: z.array(z.string().uuid()).min(1).max(500) }),
-      req.body,
-    );
+    const input = parseBody(BulkLeadIdsSchema, req.body);
     const r = await leadService.bulkRestore(req.workspace!.id, input.leadIds);
     return ok(r, `${r.restored} leads restored`);
   });

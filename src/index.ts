@@ -26,7 +26,6 @@ import { registerFollowupRoutes } from './routes/followups.routes';
 import { registerDomainHealthRoutes } from './routes/domain-health.routes';
 import { registerTwilioRoutes } from './routes/twilio.routes';
 import { registerPublicIntakeRoutes } from './routes/public-intake.routes';
-import { registerPublicSalesIntakeRoutes } from './routes/public-sales-intake.routes';
 import { registerInboundLeadsRoutes } from './routes/inbound-leads.routes';
 import { registerSalesActivityRoutes } from './routes/sales-activity.routes';
 import { registerSalesTrainingRoutes } from './routes/sales-training.routes';
@@ -131,7 +130,6 @@ async function main(): Promise<void> {
   await registerDomainHealthRoutes(app);
   await registerTwilioRoutes(app);
   await registerPublicIntakeRoutes(app);
-  await registerPublicSalesIntakeRoutes(app);
   await registerInboundLeadsRoutes(app);
   await registerSalesActivityRoutes(app);
   await registerSalesTrainingRoutes(app);

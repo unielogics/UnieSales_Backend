@@ -25,6 +25,7 @@ import { lookupRouting, type IntakeSite } from '../config/intake-routing';
 import { splitName } from './util/name-splitter';
 import * as postIntakeRunner from './post-intake-runner.service';
 import * as activity from './sales-activity.service';
+import * as notify from './notification.service';
 
 // Top-level envelope keys that form payloads MUST NOT overwrite. If a form's
 // `fields` object contains any of these as a key, we reject the submission —
@@ -125,7 +126,26 @@ export async function submit(input: IntakeSubmitInput): Promise<IntakeSubmitResu
   // 2. Reject form-supplied collisions on protected envelope keys.
   assertNoProtectedCollisions(body.fields);
 
-  // 3. Suppression check — if this email was previously bounced or unsubscribed,
+  // 3. Cortex mirrors can retry the same catalog audit. For those, the stable
+  //    idempotency key is meta.cortex_reference rather than email/campaign.
+  const cortexReference = stringOrNull(body.meta?.['cortex_reference']);
+  if (site === 'uniecortex' && body.tag === 'website_catalog_audit' && cortexReference) {
+    const db = getDb();
+    const [existing] = await db
+      .select({ id: leads.id })
+      .from(leads)
+      .where(
+        and(
+          eq(leads.workspaceId, workspaceId),
+          eq(leads.campaignId, campaignId),
+          sql`${leads.customFields}->'meta'->>'cortex_reference' = ${cortexReference}`,
+        ),
+      )
+      .limit(1);
+    if (existing) return { lead_id: existing.id };
+  }
+
+  // 4. Suppression check — if this email was previously bounced or unsubscribed,
   //    record nothing and signal a soft success to the caller (treat as 409).
   const emailLower = body.contact.email.trim().toLowerCase();
   if (await suppression.isSuppressed(workspaceId, emailLower)) {
@@ -134,7 +154,7 @@ export async function submit(input: IntakeSubmitInput): Promise<IntakeSubmitResu
     ]);
   }
 
-  // 4. Name splitting. Forms that already send first/last separately can pass
+  // 5. Name splitting. Forms that already send first/last separately can pass
   //    them inside `fields` — we honour those when present; otherwise we split.
   const fieldsObj = (body.fields ?? {}) as Record<string, unknown>;
   const explicitFirst = stringOrNull(fieldsObj['firstName'] ?? fieldsObj['first_name'] ?? null);
@@ -149,7 +169,7 @@ export async function submit(input: IntakeSubmitInput): Promise<IntakeSubmitResu
     [firstName, lastName].filter(Boolean).join(' ').trim() ||
     null;
 
-  // 5. Compose the custom_fields envelope. Protected top-level keys come from
+  // 6. Compose the custom_fields envelope. Protected top-level keys come from
   //    the validated envelope; `flat` is our AI convenience namespace.
   const customFields = {
     site,
@@ -163,10 +183,11 @@ export async function submit(input: IntakeSubmitInput): Promise<IntakeSubmitResu
   // The leads.customFields drizzle type is Record<string,string>; we store
   // a richer nested object — Postgres jsonb accepts it. The cast is safe.
 
-  // 6. Insert the lead. The DB's partial unique index on (workspace, lower(email),
+  // 7. Insert the lead. The DB's partial unique index on (workspace, lower(email),
   //    campaign) raises 23505 if a duplicate exists → translate to 409.
   const db = getDb();
   const sourceTag = `${site}_${body.tag}`;
+  const isCatalogAudit = site === 'uniecortex' && body.tag === 'website_catalog_audit';
   const insertValues: NewLead = {
     workspaceId,
     campaignId,
@@ -181,10 +202,11 @@ export async function submit(input: IntakeSubmitInput): Promise<IntakeSubmitResu
     state: body.contact.state?.trim() || null,
     source: sourceTag,
     sourceUrl: body.page_url,
-    sourceNotes: stringOrNull(fieldsObj['notes']),
+    sourceNotes: isCatalogAudit ? catalogAuditNotes(body.fields, body.meta) : stringOrNull(fieldsObj['notes']),
     customFields,
     status: 'pending_review',
     importOrigin: 'intake',
+    pipelineStage: isCatalogAudit ? 'new_catalog_audit' : null,
   };
 
   let row;
@@ -220,6 +242,19 @@ export async function submit(input: IntakeSubmitInput): Promise<IntakeSubmitResu
       /* swallow — activity is best-effort */
     }
     try {
+      await notify.emit({
+        workspaceId,
+        leadId: row.id,
+        kind: 'handoff',
+        priority: 'urgent',
+        title: `New form submission — ${sourceTag}`,
+        body: [contactName, insertValues.companyName, emailLower].filter(Boolean).join(' · '),
+        meta: body.page_url,
+      });
+    } catch {
+      /* swallow — notifications are best-effort */
+    }
+    try {
       await postIntakeRunner.run({ workspaceId, leadId: row.id, campaignId });
     } catch (err) {
       // Log only — never throw out of the fire-and-forget chain. The lock
@@ -237,6 +272,26 @@ function stringOrNull(v: unknown): string | null {
   if (typeof v === 'string') return v.trim() || null;
   if (typeof v === 'number' || typeof v === 'boolean') return String(v);
   return null;
+}
+
+function catalogAuditNotes(
+  fields: Record<string, unknown> | undefined,
+  meta: Record<string, unknown> | undefined,
+): string | null {
+  const parts = [
+    'UnieConnect Catalog Audit',
+    stringOrNull(meta?.['cortex_reference']) ? `Reference: ${stringOrNull(meta?.['cortex_reference'])}` : null,
+    stringOrNull(fields?.['confidence']) ? `Confidence: ${stringOrNull(fields?.['confidence'])}` : null,
+    stringOrNull(fields?.['product_count'] ?? fields?.['productCount'])
+      ? `Products: ${stringOrNull(fields?.['product_count'] ?? fields?.['productCount'])}`
+      : null,
+    stringOrNull(fields?.['blockers']) ? `Blockers: ${stringOrNull(fields?.['blockers'])}` : null,
+    stringOrNull(fields?.['savings']) ? `Savings: ${stringOrNull(fields?.['savings'])}` : null,
+    stringOrNull(fields?.['next_actions'] ?? fields?.['nextActions'])
+      ? `Next actions: ${stringOrNull(fields?.['next_actions'] ?? fields?.['nextActions'])}`
+      : null,
+  ].filter(Boolean);
+  return parts.length > 1 ? parts.join(' | ') : 'UnieConnect Catalog Audit';
 }
 
 /**

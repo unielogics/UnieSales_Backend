@@ -81,6 +81,7 @@ export async function handleOAuthCallback(code: string, state: string): Promise<
         refreshTokenEncrypted: tokens.refresh_token ? encrypt(tokens.refresh_token) : existing[0].refreshTokenEncrypted,
         tokenExpiry: expiry,
         googleUserId: info.data.id ?? existing[0].googleUserId,
+        connectedByUserId: existing[0].connectedByUserId ?? parsedState.initiatedBy,
         domain: domain ?? existing[0].domain,
         isActive: true,
         updatedAt: new Date(),
@@ -103,6 +104,7 @@ export async function handleOAuthCallback(code: string, state: string): Promise<
       email,
       senderName: info.data.name ?? null,
       googleUserId: info.data.id ?? null,
+      connectedByUserId: parsedState.initiatedBy,
       accessTokenEncrypted: encrypt(tokens.access_token),
       refreshTokenEncrypted: encrypt(tokens.refresh_token),
       tokenExpiry: expiry,
@@ -485,6 +487,8 @@ export interface SendInput {
   // operator-driven sends are how a domain *rebuilds* reputation. A 'paused'
   // account is still blocked.
   bypassHealthGate?: boolean;
+  /** Transactional sends (booking confirmations/reminders) should not consume campaign daily budget. */
+  bypassDailyLimit?: boolean;
   /** Campaign knowledge file ids to attach (must be flagged attach_to_emails). */
   attachmentFileIds?: string[];
 }
@@ -503,7 +507,7 @@ export async function sendEmail(input: SendInput): Promise<SendResult> {
   if (account.healthStatus === 'at_risk' && !input.bypassHealthGate) {
     throw new ConflictError('Gmail account health is at_risk');
   }
-  if (account.dailySentCount >= account.dailySendLimit) {
+  if (!input.bypassDailyLimit && account.dailySentCount >= account.dailySendLimit) {
     throw new ConflictError('Daily send limit reached for this Gmail account');
   }
 
@@ -612,7 +616,7 @@ export async function sendEmail(input: SendInput): Promise<SendResult> {
   await db
     .update(gmailAccounts)
     .set({
-      dailySentCount: account.dailySentCount + 1,
+      dailySentCount: input.bypassDailyLimit ? account.dailySentCount : account.dailySentCount + 1,
       lastSyncAt: new Date(),
       updatedAt: new Date(),
     })
@@ -706,9 +710,9 @@ export async function syncThread(
   if (existingThread[0]) {
     threadRow = existingThread[0];
   } else {
-    // Only ingest a NEW thread if one of its participants is a known lead that
-    // belongs to a campaign. The operator's own personal/business mail (bank
-    // alerts, SaaS notifications, etc.) is never pulled into the system.
+    // Only ingest a NEW thread if one of its participants is a known lead.
+    // Booking-page / intake leads may not have a campaign_id yet, but the
+    // operator still needs their Gmail history centralized in the lead file.
     const participants = new Set<string>();
     for (const m of messages) {
       const hs = m.payload?.headers ?? [];
@@ -728,7 +732,6 @@ export async function syncThread(
         .where(
           and(
             eq(leads.workspaceId, workspaceId),
-            isNotNull(leads.campaignId),
             inArray(leads.email, [...participants]),
           ),
         )
@@ -828,6 +831,54 @@ export async function syncThread(
       : null;
 
   return { messagesSynced: synced, newInboundReply };
+}
+
+/**
+ * Search every connected Gmail account for threads involving an email address
+ * and sync the matches into UnieSales. The related-conversations endpoint uses
+ * this as a best-effort hydration step before reading from the local DB.
+ */
+export async function searchAndSyncThreadsByEmail(
+  workspaceId: string,
+  email: string,
+  maxPerAccount = 10,
+): Promise<{ searchedAccounts: number; threadsSeen: number; messagesSynced: number }> {
+  const needle = email.trim().toLowerCase();
+  if (!needle) return { searchedAccounts: 0, threadsSeen: 0, messagesSynced: 0 };
+
+  const accounts = (await listAccounts(workspaceId)).filter(
+    (a) => a.isActive && a.healthStatus !== 'paused',
+  );
+  let threadsSeen = 0;
+  let messagesSynced = 0;
+
+  for (const account of accounts) {
+    try {
+      const client = await authClientForAccount(account);
+      const gmail = google.gmail({ version: 'v1', auth: client });
+      const res = await gmail.users.threads.list({
+        userId: 'me',
+        q: `{from:${needle} to:${needle} cc:${needle}}`,
+        maxResults: maxPerAccount,
+      });
+      const threads = res.data.threads ?? [];
+      threadsSeen += threads.length;
+      for (const t of threads) {
+        if (!t.id) continue;
+        try {
+          const synced = await syncThread(workspaceId, account.id, t.id);
+          messagesSynced += synced.messagesSynced;
+        } catch {
+          // A single Gmail thread should not prevent the rest of the lead file
+          // from loading. The DB read below still returns what is already synced.
+        }
+      }
+    } catch {
+      // Same principle at account level: best-effort hydration.
+    }
+  }
+
+  return { searchedAccounts: accounts.length, threadsSeen, messagesSynced };
 }
 
 function extractPlainTextBody(message: {

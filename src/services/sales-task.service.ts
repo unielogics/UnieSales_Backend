@@ -98,7 +98,7 @@ export async function list(
     const intakeLeads = db
       .select({ id: leads.id })
       .from(leads)
-      .where(and(eq(leads.workspaceId, workspaceId), eq(leads.importOrigin, 'intake')));
+      .where(and(eq(leads.workspaceId, workspaceId), inArray(leads.importOrigin, ['intake', 'sales_manual'])));
     conds.push(inArray(salesTasks.leadId, intakeLeads));
   } else if (opts.origin === 'outbound') {
     const outboundLeads = db
@@ -107,7 +107,7 @@ export async function list(
       .where(
         and(
           eq(leads.workspaceId, workspaceId),
-          or(isNull(leads.importOrigin), ne(leads.importOrigin, 'intake'))!,
+          or(isNull(leads.importOrigin), sql`${leads.importOrigin} NOT IN ('intake', 'sales_manual')`)!,
         ),
       );
     conds.push(or(isNull(salesTasks.leadId), inArray(salesTasks.leadId, outboundLeads))!);
@@ -212,7 +212,7 @@ export async function countsByStatus(
     const intakeLeads = db
       .select({ id: leads.id })
       .from(leads)
-      .where(and(eq(leads.workspaceId, workspaceId), eq(leads.importOrigin, 'intake')));
+      .where(and(eq(leads.workspaceId, workspaceId), inArray(leads.importOrigin, ['intake', 'sales_manual'])));
     conds.push(inArray(salesTasks.leadId, intakeLeads));
   } else if (opts.origin === 'outbound') {
     const outboundLeads = db
@@ -221,7 +221,7 @@ export async function countsByStatus(
       .where(
         and(
           eq(leads.workspaceId, workspaceId),
-          or(isNull(leads.importOrigin), ne(leads.importOrigin, 'intake'))!,
+          or(isNull(leads.importOrigin), sql`${leads.importOrigin} NOT IN ('intake', 'sales_manual')`)!,
         ),
       );
     conds.push(or(isNull(salesTasks.leadId), inArray(salesTasks.leadId, outboundLeads))!);

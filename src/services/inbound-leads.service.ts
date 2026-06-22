@@ -23,7 +23,7 @@ export interface InboundLeadsFilters {
    */
   filter?:
     | 'all'
-    | 'needs_review'   // pipeline_stage = 'ai_reviewed' or 'new_inbound'
+    | 'needs_review'   // pipeline_stage = 'ai_reviewed', 'new_inbound', or 'new_catalog_audit'
     | 'booking_ready'  // status in (interested, info_sent) — heuristic
     | 'handoff_required'
     | 'closed';        // lifecycle_status = 'closed'
@@ -78,6 +78,7 @@ function knownSources(): string[] {
       out.push(`${site}_${tag}`);
     }
   }
+  out.push('booking_page');
   return out;
 }
 
@@ -100,12 +101,12 @@ export async function list(
   const offset = Math.max(f.offset ?? 0, 0);
 
   // ---- WHERE clause ------------------------------------------------------
-  // Defensive: require import_origin='intake' so even if a manually-created
-  // lead ever gets a `source` matching one of our intake source strings, it
-  // won't slip into this view. The Sales-mode UX shows intake leads only.
+  // Sales-mode view includes real public intake leads and manually enrolled
+  // Sales leads. Manual Sales leads only appear in the broad view, not in
+  // site/tag-specific form filters.
   const conds = [
     eq(leads.workspaceId, workspaceId),
-    eq(leads.importOrigin, 'intake'),
+    inArray(leads.importOrigin, ['intake', 'sales_manual']),
     // Soft-delete filter — deleted leads are invisible to the operator
     // and to every AI worker.
     sql`${leads.deletedAt} IS NULL`,
@@ -123,20 +124,22 @@ export async function list(
     const sources = [`${f.site}_${f.tag}`];
     if (f.includeTests) sources.push(TEST_SOURCE);
     conds.push(inArray(leads.source, sources));
+    conds.push(eq(leads.importOrigin, 'intake'));
   } else if (f.site) {
     const tags = SITE_TAGS[f.site] as readonly string[];
     const sources = tags.map((t) => `${f.site}_${t}`);
     if (f.includeTests) sources.push(TEST_SOURCE);
     conds.push(inArray(leads.source, sources));
+    conds.push(eq(leads.importOrigin, 'intake'));
   } else {
-    const sources = knownSources();
+    const sources = [...knownSources(), 'manual_sales'];
     if (f.includeTests) sources.push(TEST_SOURCE);
     conds.push(inArray(leads.source, sources));
   }
 
   if (f.filter === 'needs_review') {
     conds.push(
-      sql`(${leads.pipelineStage} IS NULL OR ${leads.pipelineStage} IN ('new_inbound', 'ai_reviewed'))`,
+      sql`(${leads.pipelineStage} IS NULL OR ${leads.pipelineStage} IN ('new_inbound', 'ai_reviewed', 'new_catalog_audit'))`,
     );
   } else if (f.filter === 'booking_ready') {
     conds.push(inArray(leads.status, ['interested', 'info_sent', 'meeting_requested']));

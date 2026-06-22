@@ -1,4 +1,4 @@
-// PM2 process map: api + 5 workers.
+// PM2 process map: api + 7 workers.
 const workerLog = (name) => ({
   out_file: `/opt/uniesales/logs/${name}.out.log`,
   error_file: `/opt/uniesales/logs/${name}.err.log`,
@@ -58,6 +58,13 @@ module.exports = {
       instances: 1,
       env: { NODE_ENV: 'production' },
       ...workerLog('lead-source-worker'),
+    },
+    {
+      name: 'notifications-worker',
+      script: './dist/workers/notifications.worker.js',
+      instances: 1,
+      env: { NODE_ENV: 'production' },
+      ...workerLog('notifications-worker'),
     },
   ],
 };

@@ -107,6 +107,10 @@ export const leads = pgTable(
 
     createdAt: timestamp('created_at', { withTimezone: false }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: false }).notNull().defaultNow(),
+
+    // Set when the notifications worker has pushed a "deal at risk" alert.
+    // Re-armed (re-notified) only after a week of continued staleness.
+    riskNotifiedAt: timestamp('risk_notified_at', { withTimezone: false }),
   },
   (t) => ({
     workspaceIdx: index('leads_workspace_idx').on(t.workspaceId),

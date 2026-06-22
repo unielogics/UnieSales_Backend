@@ -1,13 +1,23 @@
-import { and, asc, desc, eq, ilike, inArray, sql, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, ilike, inArray, isNull, sql, type SQL } from 'drizzle-orm';
 import { getDb } from '../config/db';
 import { leads, LEAD_STATUSES, type Lead, type LeadStatus, type NewLead } from '../db/schema/leads';
+import { workspaceMembers } from '../db/schema/workspace-members';
+import { campaigns } from '../db/schema/campaigns';
+import { emailThreads } from '../db/schema/email-threads';
 import { emailMessages } from '../db/schema/email-messages';
 import { aiActions, type AiAction } from '../db/schema/ai-actions';
 import { calendarEvents } from '../db/schema/calendar-events';
 import { handoffs } from '../db/schema/handoffs';
-import { ConflictError, NotFoundError, ValidationError } from '../utils/errors';
+import { leadProcessingLocks } from '../db/schema/lead-processing-locks';
+import { notifications } from '../db/schema/notifications';
+import { salesActivities } from '../db/schema/sales-activities';
+import { salesNotes } from '../db/schema/sales-notes';
+import { salesTasks } from '../db/schema/sales-tasks';
+import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '../utils/errors';
 import * as suppressionService from './suppression.service';
 import * as notify from './notification.service';
+
+const INBOUND_WORKSPACE_ID = '00000000-0000-4000-a000-000000000001';
 
 // ---- Filters ----
 
@@ -22,8 +32,8 @@ export interface LeadFilters {
   orderDir?: 'asc' | 'desc';
   /**
    * Sales-vs-Campaigns mode isolation:
-   *  - 'intake'   → only inbound public-form leads (import_origin = 'intake')
-   *  - 'outbound' → only campaign-imported leads (import_origin IN ('upload','update') OR NULL)
+   *  - 'intake'   → Sales leads (public intake + manually enrolled Sales leads)
+   *  - 'outbound' → Campaign leads (everything outside Sales)
    *  - undefined  → no origin filter (returns everything)
    * The frontend passes 'intake' from Sales-mode pages and 'outbound' from
    * Campaigns-mode pages so the two worlds never bleed into each other.
@@ -50,14 +60,79 @@ function buildWhere(workspaceId: string, f: LeadFilters): SQL | undefined {
     );
   }
   if (f.origin === 'intake') {
-    conds.push(eq(leads.importOrigin, 'intake'));
+    conds.push(inArray(leads.importOrigin, ['intake', 'sales_manual']));
   } else if (f.origin === 'outbound') {
-    // Outbound = anything that didn't come through the public intake API.
+    // Outbound = anything outside the Sales system.
     // Includes CSV/Sheet imports ('upload', 'update') AND nulls (manual /
     // pre-Layer-1 legacy leads).
-    conds.push(sql`(${leads.importOrigin} IS NULL OR ${leads.importOrigin} <> 'intake')`);
+    conds.push(sql`(${leads.importOrigin} IS NULL OR ${leads.importOrigin} NOT IN ('intake', 'sales_manual'))`);
   }
   return conds.length === 1 ? conds[0] : and(...conds);
+}
+
+function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
+
+function roleCanWrite(role: string): boolean {
+  return role === 'owner' || role === 'admin';
+}
+
+async function assertTargetWriteAccess(tx: any, workspaceId: string, userId: string): Promise<void> {
+  const rows = await tx
+    .select({ role: workspaceMembers.role })
+    .from(workspaceMembers)
+    .where(and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, userId)))
+    .limit(1);
+  if (!rows[0] || !roleCanWrite(rows[0].role)) {
+    throw new ForbiddenError('You do not have write access to the target workspace');
+  }
+}
+
+async function findTargetLead(
+  tx: any,
+  workspaceId: string,
+  campaignId: string | null,
+  email: string,
+): Promise<Lead | null> {
+  const campaignCond = campaignId ? eq(leads.campaignId, campaignId) : isNull(leads.campaignId);
+  const rows = await tx
+    .select()
+    .from(leads)
+    .where(
+      and(
+        eq(leads.workspaceId, workspaceId),
+        campaignCond,
+        sql`lower(${leads.email}) = ${email}`,
+        isNull(leads.deletedAt),
+      ),
+    )
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+function appendSourceNote(existing: string | null | undefined, note: string): string {
+  const current = (existing ?? '').trim();
+  return current ? `${current}\n\n${note}` : note;
+}
+
+function transferSourceNote(
+  source: Lead,
+  sourceWorkspaceId: string,
+  targetMode: 'sales' | 'campaign',
+  targetWorkspaceId: string,
+  targetCampaignId: string | null,
+): string {
+  const target = targetMode === 'sales' ? 'Sales' : `Campaign ${targetCampaignId}`;
+  return [
+    `Moved to ${target} on ${new Date().toISOString()}.`,
+    `Original lead: ${source.id}.`,
+    `Original workspace: ${sourceWorkspaceId}.`,
+    source.campaignId ? `Original campaign: ${source.campaignId}.` : null,
+    `Target workspace: ${targetWorkspaceId}.`,
+  ]
+    .filter(Boolean)
+    .join(' ');
 }
 
 export interface PaginatedLeads {
@@ -128,11 +203,15 @@ export interface CreateLeadInput {
   sourceNotes?: string;
   status?: LeadStatus;
   /**
-   * Discriminator for Sales-vs-Campaigns isolation. Manual UI creates leave
-   * this undefined → defaults to 'manual' which keeps them out of Sales-mode
-   * filters. Intake-API leads come in as 'intake' from intake.service.
+   * Discriminator for Sales-vs-Campaigns isolation. Campaign manual creates
+   * leave this undefined → defaults to 'manual'. Sales manual creates pass
+   * 'sales_manual' so they appear in Sales-mode filters without pretending to
+   * be public form submissions.
    */
-  importOrigin?: 'manual' | 'upload' | 'update' | 'intake' | null;
+  importOrigin?: 'manual' | 'upload' | 'update' | 'intake' | 'sales_manual' | null;
+  lifecycleStatus?: 'active' | 'paused' | 'closed';
+  pipelineStage?: string | null;
+  aiOwner?: boolean;
 }
 
 export async function create(workspaceId: string, input: CreateLeadInput): Promise<Lead> {
@@ -162,9 +241,9 @@ export async function create(workspaceId: string, input: CreateLeadInput): Promi
         source: input.source ?? 'manual',
         sourceNotes: input.sourceNotes ?? null,
         status: input.status ?? 'new',
-        // Manual creation is outbound by definition. The intake API sets this
-        // to 'intake' through its own code path. Setting it explicitly keeps
-        // manual leads OUT of Sales-mode filters that match on import_origin.
+        lifecycleStatus: input.lifecycleStatus ?? 'active',
+        pipelineStage: input.pipelineStage ?? null,
+        aiOwner: input.aiOwner ?? true,
         importOrigin: input.importOrigin ?? 'manual',
       } as NewLead)
       .returning();
@@ -186,11 +265,19 @@ export interface UpdateLeadInput {
   email?: string;
   companyName?: string | null;
   contactName?: string | null;
+  firstName?: string | null;
+  lastName?: string | null;
   title?: string | null;
   website?: string | null;
   phone?: string | null;
   linkedinUrl?: string | null;
+  city?: string | null;
+  state?: string | null;
+  streetAddress?: string | null;
+  addressFull?: string | null;
   segment?: string | null;
+  source?: string | null;
+  sourceUrl?: string | null;
   status?: LeadStatus;
   leadScore?: number;
   leadScoreReason?: string;
@@ -233,9 +320,200 @@ export async function update(workspaceId: string, leadId: string, patch: UpdateL
 }
 
 export async function remove(workspaceId: string, leadId: string): Promise<void> {
-  await getById(workspaceId, leadId);
+  const r = await bulkPermanentDelete(workspaceId, [leadId]);
+  if (r.deleted === 0) throw new NotFoundError('Lead not found');
+}
+
+export async function bulkPermanentDelete(
+  workspaceId: string,
+  leadIds: string[],
+): Promise<{ deleted: number }> {
+  if (leadIds.length === 0) return { deleted: 0 };
+  const uniqueIds = Array.from(new Set(leadIds));
   const db = getDb();
-  await db.delete(leads).where(and(eq(leads.workspaceId, workspaceId), eq(leads.id, leadId)));
+  return db.transaction(async (tx) => {
+    const rows = await tx
+      .select({ id: leads.id, email: leads.email })
+      .from(leads)
+      .where(and(eq(leads.workspaceId, workspaceId), inArray(leads.id, uniqueIds)));
+    if (rows.length === 0) return { deleted: 0 };
+    const ids = rows.map((r) => r.id);
+
+    await tx
+      .delete(salesNotes)
+      .where(and(eq(salesNotes.workspaceId, workspaceId), inArray(salesNotes.leadId, ids)));
+    await tx
+      .delete(salesTasks)
+      .where(and(eq(salesTasks.workspaceId, workspaceId), inArray(salesTasks.leadId, ids)));
+    await tx
+      .delete(salesActivities)
+      .where(and(eq(salesActivities.workspaceId, workspaceId), inArray(salesActivities.leadId, ids)));
+    await tx
+      .delete(handoffs)
+      .where(and(eq(handoffs.workspaceId, workspaceId), inArray(handoffs.leadId, ids)));
+    await tx
+      .delete(leadProcessingLocks)
+      .where(and(eq(leadProcessingLocks.workspaceId, workspaceId), inArray(leadProcessingLocks.leadId, ids)));
+
+    await tx
+      .update(aiActions)
+      .set({ leadId: null })
+      .where(and(eq(aiActions.workspaceId, workspaceId), inArray(aiActions.leadId, ids)));
+    await tx
+      .update(emailMessages)
+      .set({ leadId: null })
+      .where(and(eq(emailMessages.workspaceId, workspaceId), inArray(emailMessages.leadId, ids)));
+    await tx
+      .update(emailThreads)
+      .set({ leadId: null })
+      .where(and(eq(emailThreads.workspaceId, workspaceId), inArray(emailThreads.leadId, ids)));
+    await tx
+      .update(calendarEvents)
+      .set({ leadId: null, updatedAt: new Date() })
+      .where(and(eq(calendarEvents.workspaceId, workspaceId), inArray(calendarEvents.leadId, ids)));
+    await tx
+      .update(notifications)
+      .set({ leadId: null })
+      .where(and(eq(notifications.workspaceId, workspaceId), inArray(notifications.leadId, ids)));
+
+    const deleted = await tx
+      .delete(leads)
+      .where(and(eq(leads.workspaceId, workspaceId), inArray(leads.id, ids)))
+      .returning({ id: leads.id });
+    return { deleted: deleted.length };
+  });
+}
+
+export interface MoveLeadsInput {
+  leadIds: string[];
+  targetMode: 'sales' | 'campaign';
+  targetWorkspaceId?: string;
+  targetCampaignId?: string;
+  userId: string;
+}
+
+export interface MoveLeadsResult {
+  moved: number;
+  created: number;
+  merged: number;
+  archived: number;
+  targets: Array<{ sourceLeadId: string; targetLeadId: string; targetWorkspaceId: string; created: boolean }>;
+}
+
+export async function moveLeads(workspaceId: string, input: MoveLeadsInput): Promise<MoveLeadsResult> {
+  if (input.leadIds.length === 0) return { moved: 0, created: 0, merged: 0, archived: 0, targets: [] };
+  const uniqueIds = Array.from(new Set(input.leadIds));
+  const targetWorkspaceId = input.targetMode === 'sales' ? INBOUND_WORKSPACE_ID : input.targetWorkspaceId;
+  if (!targetWorkspaceId) {
+    throw new ValidationError('Target workspace is required', [
+      { field: 'targetWorkspaceId', reason: 'required for campaign moves' },
+    ]);
+  }
+  if (input.targetMode === 'campaign' && !input.targetCampaignId) {
+    throw new ValidationError('Target campaign is required', [
+      { field: 'targetCampaignId', reason: 'required for campaign moves' },
+    ]);
+  }
+
+  const db = getDb();
+  return db.transaction(async (tx) => {
+    await assertTargetWriteAccess(tx, targetWorkspaceId, input.userId);
+    if (input.targetMode === 'campaign') {
+      const targetCampaign = await tx
+        .select({ id: campaigns.id })
+        .from(campaigns)
+        .where(and(eq(campaigns.workspaceId, targetWorkspaceId), eq(campaigns.id, input.targetCampaignId!)))
+        .limit(1);
+      if (!targetCampaign[0]) throw new NotFoundError('Target campaign not found');
+    }
+
+    const sourceRows = await tx
+      .select()
+      .from(leads)
+      .where(and(eq(leads.workspaceId, workspaceId), inArray(leads.id, uniqueIds), isNull(leads.deletedAt)));
+    if (sourceRows.length === 0) return { moved: 0, created: 0, merged: 0, archived: 0, targets: [] };
+
+    const targets: MoveLeadsResult['targets'] = [];
+    let created = 0;
+    let merged = 0;
+    for (const source of sourceRows) {
+      const email = normalizeEmail(source.email);
+      const targetCampaignId = input.targetMode === 'campaign' ? input.targetCampaignId! : null;
+      const existing = await findTargetLead(tx, targetWorkspaceId, targetCampaignId, email);
+      const transferNote = transferSourceNote(source, workspaceId, input.targetMode, targetWorkspaceId, targetCampaignId);
+      if (existing) {
+        const [updated] = await tx
+          .update(leads)
+          .set({
+            companyName: existing.companyName ?? source.companyName,
+            contactName: existing.contactName ?? source.contactName,
+            firstName: existing.firstName ?? source.firstName,
+            lastName: existing.lastName ?? source.lastName,
+            title: existing.title ?? source.title,
+            phone: existing.phone ?? source.phone,
+            website: existing.website ?? source.website,
+            linkedinUrl: existing.linkedinUrl ?? source.linkedinUrl,
+            segment: existing.segment ?? source.segment,
+            sourceNotes: appendSourceNote(existing.sourceNotes, transferNote),
+            updatedAt: new Date(),
+          })
+          .where(and(eq(leads.workspaceId, targetWorkspaceId), eq(leads.id, existing.id)))
+          .returning();
+        merged += 1;
+        targets.push({ sourceLeadId: source.id, targetLeadId: updated!.id, targetWorkspaceId, created: false });
+      } else {
+        const [inserted] = await tx
+          .insert(leads)
+          .values({
+            workspaceId: targetWorkspaceId,
+            campaignId: targetCampaignId,
+            email,
+            companyName: source.companyName,
+            contactName: source.contactName,
+            firstName: source.firstName,
+            lastName: source.lastName,
+            title: source.title,
+            website: source.website,
+            phone: source.phone,
+            linkedinUrl: source.linkedinUrl,
+            segment: source.segment,
+            source: input.targetMode === 'sales' ? 'campaign_upgrade' : 'sales_demote',
+            sourceUrl: source.sourceUrl,
+            sourceNotes: appendSourceNote(source.sourceNotes, transferNote),
+            status: input.targetMode === 'sales' ? 'interested' : 'new',
+            lifecycleStatus: 'active',
+            pipelineStage: input.targetMode === 'sales' ? 'new_inbound' : null,
+            aiOwner: false,
+            importOrigin: input.targetMode === 'sales' ? 'sales_manual' : 'manual',
+            customFields: source.customFields,
+          } as NewLead)
+          .returning();
+        created += 1;
+        targets.push({ sourceLeadId: source.id, targetLeadId: inserted!.id, targetWorkspaceId, created: true });
+      }
+    }
+
+    const archivedRows = await tx
+      .update(leads)
+      .set({
+        deletedAt: new Date(),
+        aiOwner: false,
+        lifecycleStatus: 'closed',
+        status: 'closed_manual',
+        nextActionAt: null,
+        updatedAt: new Date(),
+      })
+      .where(and(eq(leads.workspaceId, workspaceId), inArray(leads.id, sourceRows.map((l) => l.id))))
+      .returning({ id: leads.id });
+
+    return {
+      moved: targets.length,
+      created,
+      merged,
+      archived: archivedRows.length,
+      targets,
+    };
+  });
 }
 
 /**

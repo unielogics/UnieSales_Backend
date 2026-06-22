@@ -1,4 +1,4 @@
--- Seed the Inbound workspace + 9 source-tagged campaigns for public intake.
+-- Seed the Inbound workspace + source-tagged campaigns for public intake.
 -- Idempotent: uses deterministic UUIDs + ON CONFLICT DO NOTHING so reruns
 -- (and prod ↔ dev parity) are safe.
 --
@@ -76,7 +76,11 @@ VALUES
     'unielogics_products_inquiry', 'active', 'inbound'),
   ('00000000-0000-4001-a000-000000000012'::uuid,
     '00000000-0000-4000-a000-000000000001'::uuid,
-    'unielogics_services_inquiry', 'active', 'inbound')
+    'unielogics_services_inquiry', 'active', 'inbound'),
+  -- Native UnieConnect catalog audit mirror from Cortex.
+  ('00000000-0000-4001-a000-000000000013'::uuid,
+    '00000000-0000-4000-a000-000000000001'::uuid,
+    'uniecortex_website_catalog_audit', 'active', 'inbound')
 ON CONFLICT (id) DO NOTHING;
 
 COMMIT;

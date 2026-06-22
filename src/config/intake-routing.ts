@@ -30,7 +30,7 @@ export const SITE_TAGS = {
     'products_inquiry',
     'services_inquiry',
   ],
-  uniecortex: ['audit_request', 'partner_application'],
+  uniecortex: ['audit_request', 'partner_application', 'website_catalog_audit'],
 } as const satisfies Record<IntakeSite, readonly string[]>;
 
 export type UniewmsTag = (typeof SITE_TAGS.uniewms)[number];
@@ -48,6 +48,7 @@ export const SOURCE_ROUTING: Record<string, { workspaceId: string; campaignId: s
   'unielogics.developer':            { workspaceId: INTAKE_WORKSPACE_ID, campaignId: '00000000-0000-4001-a000-000000000007' },
   'uniecortex.audit_request':        { workspaceId: INTAKE_WORKSPACE_ID, campaignId: '00000000-0000-4001-a000-000000000008' },
   'uniecortex.partner_application':  { workspaceId: INTAKE_WORKSPACE_ID, campaignId: '00000000-0000-4001-a000-000000000009' },
+  'uniecortex.website_catalog_audit': { workspaceId: INTAKE_WORKSPACE_ID, campaignId: '00000000-0000-4001-a000-000000000013' },
   // Added 2026-05-26 — unielogics.com form expansion. Suffixes continue sequentially.
   'unielogics.industry_problems':    { workspaceId: INTAKE_WORKSPACE_ID, campaignId: '00000000-0000-4001-a000-000000000010' },
   'unielogics.products_inquiry':     { workspaceId: INTAKE_WORKSPACE_ID, campaignId: '00000000-0000-4001-a000-000000000011' },

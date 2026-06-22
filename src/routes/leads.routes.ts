@@ -10,6 +10,7 @@ import * as threadService from '../services/thread.service';
 import * as aiTasks from '../services/ai-tasks.service';
 import * as gmailService from '../services/gmail.service';
 import * as bookingPageService from '../services/booking-page.service';
+import * as activityService from '../services/sales-activity.service';
 import { sendSmsToLead } from '../services/sms.service';
 import { ConflictError } from '../utils/errors';
 import { LEAD_STATUSES, type LeadStatus } from '../db/schema/leads';
@@ -30,6 +31,10 @@ const ListQuery = z.object({
   // only; `outbound` = CSV/Sheet/manual leads only; omitted = everything.
   origin: z.enum(['intake', 'outbound']).optional(),
 });
+const RelatedConversationsQuery = z.object({
+  sync: z.union([z.literal('true'), z.literal('1')]).optional(),
+  limit: z.coerce.number().int().positive().max(50).optional(),
+});
 
 const CreateSchema = z.object({
   email: z.string().email().max(254),
@@ -44,17 +49,29 @@ const CreateSchema = z.object({
   source: z.string().max(120).optional(),
   sourceNotes: z.string().optional(),
   status: z.string().optional(),
+  lifecycleStatus: z.enum(['active', 'paused', 'closed']).optional(),
+  pipelineStage: z.string().max(50).nullable().optional(),
+  aiOwner: z.boolean().optional(),
+  importOrigin: z.enum(['manual', 'upload', 'update', 'intake', 'sales_manual']).nullable().optional(),
 });
 
 const UpdateSchema = z.object({
   campaignId: z.string().uuid().optional(),
   companyName: z.string().max(200).nullable().optional(),
   contactName: z.string().max(200).nullable().optional(),
+  firstName: z.string().max(200).nullable().optional(),
+  lastName: z.string().max(200).nullable().optional(),
   title: z.string().max(200).nullable().optional(),
   website: z.string().max(500).nullable().optional(),
   phone: z.string().max(50).nullable().optional(),
   linkedinUrl: z.string().max(500).nullable().optional(),
+  city: z.string().max(120).nullable().optional(),
+  state: z.string().max(120).nullable().optional(),
+  streetAddress: z.string().max(300).nullable().optional(),
+  addressFull: z.string().max(500).nullable().optional(),
   segment: z.string().max(120).nullable().optional(),
+  source: z.string().max(120).nullable().optional(),
+  sourceUrl: z.string().max(500).nullable().optional(),
   status: z.string().optional(),
   leadScore: z.number().int().min(0).max(100).optional(),
   leadScoreReason: z.string().max(2000).optional(),
@@ -72,6 +89,16 @@ const UpdateSchema = z.object({
 const BulkSchema = z.object({
   leadIds: z.array(z.string().uuid()).min(1).max(500),
   patch: UpdateSchema,
+});
+const BulkLeadIdsSchema = z.object({
+  leadIds: z.array(z.string().uuid()).min(1).max(500),
+});
+const MoveLeadsSchema = z.object({
+  leadIds: z.array(z.string().uuid()).min(1).max(500),
+  targetMode: z.enum(['sales', 'campaign']),
+  targetWorkspaceId: z.string().uuid().optional(),
+  targetCampaignId: z.string().uuid().optional(),
+  archiveSource: z.literal(true).optional().default(true),
 });
 
 const PauseSchema = z.object({ pausedUntil: z.string().datetime().optional() });
@@ -163,22 +190,36 @@ export async function registerLeadRoutes(app: FastifyInstance): Promise<void> {
   // Soft-delete a batch of leads. Sets deleted_at + flips aiOwner off so
   // every UI surface and every worker stops touching them. Idempotent.
   app.post(`${base}/bulk-delete`, { preHandler: WRITE }, async (req) => {
-    const input = parseBody(
-      z.object({ leadIds: z.array(z.string().uuid()).min(1).max(500) }),
-      req.body,
-    );
+    const input = parseBody(BulkLeadIdsSchema, req.body);
     const r = await leadService.bulkSoftDelete(req.workspace!.id, input.leadIds);
     return ok(r, `${r.deleted} leads deleted`);
+  });
+
+  // Permanently delete lead files. Linked operational rows are removed,
+  // reporting/history rows are detached, then the lead rows are deleted.
+  app.post(`${base}/bulk-permanent-delete`, { preHandler: WRITE }, async (req) => {
+    const input = parseBody(BulkLeadIdsSchema, req.body);
+    const r = await leadService.bulkPermanentDelete(req.workspace!.id, input.leadIds);
+    return ok(r, `${r.deleted} leads permanently deleted`);
+  });
+
+  app.post(`${base}/move`, { preHandler: WRITE }, async (req) => {
+    const input = parseBody(MoveLeadsSchema, req.body);
+    const r = await leadService.moveLeads(req.workspace!.id, {
+      leadIds: input.leadIds,
+      targetMode: input.targetMode,
+      targetWorkspaceId: input.targetWorkspaceId,
+      targetCampaignId: input.targetCampaignId,
+      userId: req.user!.id,
+    });
+    return ok(r, `${r.moved} leads moved`);
   });
 
   // Cancel a batch of scheduled outbound sends. Backs the AI Queue's
   // "Scheduled to send" delete affordance — clears next_action_at so the
   // followup worker stops picking these leads up. Lead survives.
   app.post(`${base}/bulk-cancel-scheduled`, { preHandler: WRITE }, async (req) => {
-    const input = parseBody(
-      z.object({ leadIds: z.array(z.string().uuid()).min(1).max(500) }),
-      req.body,
-    );
+    const input = parseBody(BulkLeadIdsSchema, req.body);
     const r = await leadService.bulkCancelScheduled(req.workspace!.id, input.leadIds);
     return ok(r, `${r.cancelled} sends cancelled`);
   });
@@ -186,10 +227,7 @@ export async function registerLeadRoutes(app: FastifyInstance): Promise<void> {
   // Restore previously soft-deleted leads. No UI hook yet; here for recovery
   // via curl if the operator deletes by mistake.
   app.post(`${base}/bulk-restore`, { preHandler: WRITE }, async (req) => {
-    const input = parseBody(
-      z.object({ leadIds: z.array(z.string().uuid()).min(1).max(500) }),
-      req.body,
-    );
+    const input = parseBody(BulkLeadIdsSchema, req.body);
     const r = await leadService.bulkRestore(req.workspace!.id, input.leadIds);
     return ok(r, `${r.restored} leads restored`);
   });
@@ -213,13 +251,56 @@ export async function registerLeadRoutes(app: FastifyInstance): Promise<void> {
     return ok({ events });
   });
 
+  app.get(`${base}/:leadId/related-conversations`, { preHandler: READ }, async (req) => {
+    const { leadId } = parsePath(LeadPath, req.params);
+    const q = parseQuery(RelatedConversationsQuery, req.query);
+    let sync: Awaited<ReturnType<typeof gmailService.searchAndSyncThreadsByEmail>> | null = null;
+    if (q.sync != null) {
+      const lead = await leadService.getById(req.workspace!.id, leadId);
+      sync = await gmailService.searchAndSyncThreadsByEmail(req.workspace!.id, lead.email, 10);
+    }
+    const threads = await threadService.listRelatedByLeadEmail(
+      req.workspace!.id,
+      leadId,
+      q.limit ?? 25,
+    );
+    return ok({ threads, sync });
+  });
+
   app.patch(`${base}/:leadId`, { preHandler: WRITE }, async (req) => {
     const { leadId } = parsePath(LeadPath, req.params);
     const patch = parseBody(UpdateSchema, req.body);
+    const before = await leadService.getById(req.workspace!.id, leadId);
     const lead = await leadService.update(req.workspace!.id, leadId, {
       ...patch,
       status: patch.status as LeadStatus | undefined,
     });
+    if (patch.status && patch.status !== before.status) {
+      await activityService.emit({
+        workspaceId: req.workspace!.id,
+        leadId,
+        campaignId: lead.campaignId,
+        activityType: 'stage_changed',
+        title: 'Status changed',
+        description: `${before.status} → ${patch.status}`,
+        metadata: { from: before.status, to: patch.status, field: 'status' },
+        createdBy: req.user!.id,
+      });
+    }
+    if (patch.aiOwner != null && patch.aiOwner !== before.aiOwner) {
+      await activityService.emit({
+        workspaceId: req.workspace!.id,
+        leadId,
+        campaignId: lead.campaignId,
+        activityType: 'stage_changed',
+        title: patch.aiOwner ? 'AI enabled for lead' : 'AI disabled for lead',
+        description: patch.aiOwner
+          ? 'The AI can take actions for this lead again.'
+          : 'The AI will not take further automated actions for this lead.',
+        metadata: { from: before.aiOwner, to: patch.aiOwner, field: 'aiOwner' },
+        createdBy: req.user!.id,
+      });
+    }
     return ok({ lead }, 'Updated');
   });
 

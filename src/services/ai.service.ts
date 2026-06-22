@@ -218,7 +218,7 @@ export async function listQueue(
     const intakeLeads = db
       .select({ id: leads.id })
       .from(leads)
-      .where(and(eq(leads.workspaceId, workspaceId), eq(leads.importOrigin, 'intake')));
+      .where(and(eq(leads.workspaceId, workspaceId), inArray(leads.importOrigin, ['intake', 'sales_manual'])));
     conds.push(inArray(aiActions.leadId, intakeLeads));
   } else if (opts.origin === 'outbound') {
     const outboundLeads = db
@@ -227,7 +227,7 @@ export async function listQueue(
       .where(
         and(
           eq(leads.workspaceId, workspaceId),
-          or(isNull(leads.importOrigin), ne(leads.importOrigin, 'intake'))!,
+          or(isNull(leads.importOrigin), sql`${leads.importOrigin} NOT IN ('intake', 'sales_manual')`)!,
         ),
       );
     // Actions with no lead OR whose lead is non-intake — both belong to outbound.
@@ -303,9 +303,9 @@ export async function listPlanned(
   // Origin filter for the lead-level query (#1) below.
   const leadOriginCond =
     opts.origin === 'intake'
-      ? eq(leads.importOrigin, 'intake')
+      ? inArray(leads.importOrigin, ['intake', 'sales_manual'])
       : opts.origin === 'outbound'
-        ? or(isNull(leads.importOrigin), ne(leads.importOrigin, 'intake'))!
+        ? or(isNull(leads.importOrigin), sql`${leads.importOrigin} NOT IN ('intake', 'sales_manual')`)!
         : undefined;
 
   // 1. Scheduled sends — leads the followup worker will contact.
@@ -354,10 +354,10 @@ export async function listPlanned(
   // Origin filter on the joined lead. Actions without a lead are treated as
   // outbound (legacy default).
   if (opts.origin === 'intake') {
-    queuedConds.push(eq(leads.importOrigin, 'intake'));
+    queuedConds.push(inArray(leads.importOrigin, ['intake', 'sales_manual']));
   } else if (opts.origin === 'outbound') {
     queuedConds.push(
-      or(isNull(leads.id), isNull(leads.importOrigin), ne(leads.importOrigin, 'intake'))!,
+      or(isNull(leads.id), isNull(leads.importOrigin), sql`${leads.importOrigin} NOT IN ('intake', 'sales_manual')`)!,
     );
   }
   const queued = await db

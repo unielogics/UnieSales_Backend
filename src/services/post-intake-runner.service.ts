@@ -8,8 +8,8 @@
  *   3. Classify the lead with the new classifyLead AI task.
  *   4. Compose an `intake_summary` note that captures both outputs.
  *   5. Create a `review_ai_draft` task (Draft Only is the default mode).
- *   6. Set leads.pipeline_stage = 'ai_reviewed' and stamp
- *      post_intake_processed_at so subsequent retries no-op.
+ *   6. Set leads.pipeline_stage = 'ai_reviewed' unless a dedicated source
+ *      stage already exists, and stamp post_intake_processed_at so retries no-op.
  *   7. Mark the lock completed.
  *
  * Auto-send is intentionally NOT here. Per the Layer-2 plan, autonomous
@@ -68,6 +68,7 @@ export async function run(input: RunInput): Promise<RunResult> {
         id: leads.id,
         postIntakeProcessedAt: leads.postIntakeProcessedAt,
         campaignId: leads.campaignId,
+        pipelineStage: leads.pipelineStage,
         customFields: leads.customFields,
         deletedAt: leads.deletedAt,
       })
@@ -254,10 +255,11 @@ export async function run(input: RunInput): Promise<RunResult> {
     }
 
     // --- 7. Pipeline stage + idempotency stamp -----------------------------
+    const nextStage = leadRow.pipelineStage === 'new_catalog_audit' ? 'new_catalog_audit' : 'ai_reviewed';
     await db
       .update(leads)
       .set({
-        pipelineStage: 'ai_reviewed',
+        pipelineStage: nextStage,
         postIntakeProcessedAt: new Date(),
         updatedAt: new Date(),
       })
@@ -268,8 +270,8 @@ export async function run(input: RunInput): Promise<RunResult> {
       leadId: input.leadId,
       campaignId: input.campaignId,
       activityType: 'stage_changed',
-      title: 'Stage → ai_reviewed',
-      metadata: { from: 'new_inbound', to: 'ai_reviewed' },
+      title: `Stage -> ${nextStage}`,
+      metadata: { from: leadRow.pipelineStage ?? 'new_inbound', to: nextStage },
       createdBy: 'ai',
     });
 

@@ -17,10 +17,35 @@ const EventPath = z.object({
   eventId: z.string().uuid(),
 });
 
+const PendingQuery = z.object({
+  includeSnoozed: z.coerce.boolean().optional(),
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+});
+
 const AttendeeSchema = z.object({
   email: z.string().email(),
   name: z.string().max(200).optional(),
   responseStatus: z.string().max(40).optional(),
+});
+
+const LeadSnapshotSchema = z.object({
+  contactName: z.string().max(200).nullable().optional(),
+  firstName: z.string().max(200).nullable().optional(),
+  lastName: z.string().max(200).nullable().optional(),
+  companyName: z.string().max(200).nullable().optional(),
+  title: z.string().max(200).nullable().optional(),
+  segment: z.string().max(120).nullable().optional(),
+  email: z.string().email().nullable().optional(),
+  phone: z.string().max(50).nullable().optional(),
+  linkedinUrl: z.string().max(500).nullable().optional(),
+  website: z.string().max(500).nullable().optional(),
+  city: z.string().max(120).nullable().optional(),
+  state: z.string().max(120).nullable().optional(),
+  streetAddress: z.string().max(300).nullable().optional(),
+  addressFull: z.string().max(500).nullable().optional(),
+  source: z.string().max(120).nullable().optional(),
+  sourceUrl: z.string().max(500).nullable().optional(),
+  sourceNotes: z.string().max(8000).nullable().optional(),
 });
 
 const CreateSchema = z
@@ -33,6 +58,7 @@ const CreateSchema = z
     attendees: z.array(AttendeeSchema).max(50).optional(),
     leadId: z.string().uuid().nullable().optional(),
     campaignId: z.string().uuid().nullable().optional(),
+    leadSnapshot: LeadSnapshotSchema.nullable().optional(),
     emailThreadId: z.string().uuid().nullable().optional(),
     location: z.string().max(500).optional(),
     withMeet: z.boolean().optional(),
@@ -46,6 +72,32 @@ const UpdateSchema = z.object({
   endAt: z.coerce.date().optional(),
   location: z.string().max(500).optional(),
   status: z.enum(['confirmed', 'tentative', 'cancelled']).optional(),
+});
+
+const OutcomeSchema = z.object({
+  outcome: z.enum(['success', 'failure']),
+  notes: z.string().max(20000),
+  reason: z.enum(['no_show', 'bad_fit', 'budget', 'timing', 'competitor']).nullable().optional(),
+  nextAction: z.enum([
+    'schedule_follow_up',
+    'send_proposal',
+    'move_to_contracting',
+    'close_won',
+    'attempt_reschedule',
+    'nurture',
+  ]).nullable().optional(),
+  followUp: z.object({
+    title: z.string().min(1).max(300).optional(),
+    startAt: z.coerce.date(),
+    endAt: z.coerce.date(),
+  }).nullable().optional(),
+}).refine((v) => !v.followUp || v.followUp.endAt > v.followUp.startAt, {
+  message: 'followUp.endAt must be after followUp.startAt',
+  path: ['followUp', 'endAt'],
+});
+
+const SnoozeSchema = z.object({
+  untilAt: z.coerce.date(),
 });
 
 function parse<T extends z.ZodTypeAny>(schema: T, data: unknown, label: string): z.infer<T> {
@@ -90,6 +142,53 @@ export async function registerCalendarRoutes(app: FastifyInstance): Promise<void
     const event = await calendarService.createEvent(req.workspace!.id, input);
     reply.code(201);
     return ok({ event }, 'Event created');
+  });
+
+  app.get(`${base}/post-call-pending`, { preHandler: READ }, async (req) => {
+    const q = parse(PendingQuery, req.query, 'Invalid query');
+    const result = await calendarService.listPendingOutcomes(req.workspace!.id, req.user!.id, req.workspace!.role, q);
+    return ok(result);
+  });
+
+  app.post(`${base}/:eventId/outcome`, { preHandler: READ }, async (req) => {
+    const { eventId } = parse(EventPath, req.params, 'Invalid path');
+    const input = parse(OutcomeSchema, req.body, 'Validation failed');
+    const result = await calendarService.logOutcome(req.workspace!.id, eventId, req.user!.id, req.workspace!.role, input);
+    return ok(result, 'Meeting outcome logged');
+  });
+
+  app.post(`${base}/:eventId/outcome-snooze`, { preHandler: READ }, async (req) => {
+    const { eventId } = parse(EventPath, req.params, 'Invalid path');
+    const input = parse(SnoozeSchema, req.body, 'Validation failed');
+    const result = await calendarService.snoozeOutcome(
+      req.workspace!.id,
+      eventId,
+      req.user!.id,
+      req.workspace!.role,
+      input.untilAt,
+    );
+    return ok(result, 'Outcome prompt snoozed');
+  });
+
+  app.post(`${base}/:eventId/outcome-ignore`, { preHandler: READ }, async (req) => {
+    const { eventId } = parse(EventPath, req.params, 'Invalid path');
+    const result = await calendarService.ignoreOutcome(req.workspace!.id, eventId, req.user!.id, req.workspace!.role);
+    return ok(result, 'Post-call prompt ignored');
+  });
+
+  app.post(`${base}/:eventId/end-now`, { preHandler: READ }, async (req) => {
+    const { eventId } = parse(EventPath, req.params, 'Invalid path');
+    const result = await calendarService.endMeetingNow(req.workspace!.id, eventId, req.user!.id, req.workspace!.role);
+    return ok(result, 'Meeting ended');
+  });
+
+  app.post(`${base}/:eventId/sync-meet-artifacts`, { preHandler: READ }, async (req) => {
+    const { eventId } = parse(EventPath, req.params, 'Invalid path');
+    const result = await calendarService.syncMeetArtifacts(req.workspace!.id, eventId, {
+      userId: req.user!.id,
+      role: req.workspace!.role,
+    });
+    return ok(result, 'Google Meet artifacts synced');
   });
 
   app.patch(`${base}/:eventId`, { preHandler: WRITE }, async (req) => {

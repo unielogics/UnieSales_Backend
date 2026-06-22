@@ -10,16 +10,23 @@
  * scopes — see config/google.ts).
  */
 import { randomUUID } from 'node:crypto';
-import { and, between, desc, eq, inArray, ne } from 'drizzle-orm';
+import { and, asc, between, desc, eq, inArray, isNull, lte, ne, notInArray, or, sql } from 'drizzle-orm';
 import { google, type Auth } from 'googleapis';
 import { getDb } from '../config/db';
 import { calendarEvents, type CalendarEvent, type CalendarAttendee } from '../db/schema/calendar-events';
 import { gmailAccounts, type GmailAccount } from '../db/schema/gmail-accounts';
 import { leads } from '../db/schema/leads';
+import { salesTasks } from '../db/schema/sales-tasks';
 import { workspaces, type CalendarConfig } from '../db/schema/workspaces';
-import { ConflictError, NotFoundError } from '../utils/errors';
+import type { WorkspaceRole } from '../db/schema/workspace-members';
+import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '../utils/errors';
 import { authClientForAccount, getAccount } from './gmail.service';
 import * as notify from './notification.service';
+import * as salesActivity from './sales-activity.service';
+import * as salesNote from './sales-note.service';
+import * as salesTask from './sales-task.service';
+
+const INBOUND_WORKSPACE_ID = '00000000-0000-4000-a000-000000000001';
 
 function calendarClient(auth: Auth.OAuth2Client) {
   return google.calendar({ version: 'v3', auth });
@@ -55,6 +62,199 @@ function extractMeetLink(ev: {
   return ep?.uri ?? null;
 }
 
+async function findUniqueActiveLeadForAttendees(
+  workspaceId: string,
+  accountEmail: string,
+  attendees: CalendarAttendee[],
+): Promise<{ id: string; campaignId: string | null } | null> {
+  const emails = [...new Set(
+    attendees
+      .map((a) => a.email.trim().toLowerCase())
+      .filter((email) => email && email !== accountEmail.trim().toLowerCase()),
+  )];
+  if (emails.length === 0) return null;
+  const db = getDb();
+  const matches = await db
+    .select({ id: leads.id, campaignId: leads.campaignId })
+    .from(leads)
+    .where(
+      and(
+        eq(leads.workspaceId, workspaceId),
+        eq(leads.lifecycleStatus, 'active'),
+        sql`lower(${leads.email}) in (${sql.join(emails.map((email) => sql`${email}`), sql`,`)})`,
+      ),
+    )
+    .limit(2);
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+interface ManualLeadSnapshot {
+  contactName?: string | null;
+  firstName?: string | null;
+  lastName?: string | null;
+  companyName?: string | null;
+  title?: string | null;
+  segment?: string | null;
+  email?: string | null;
+  phone?: string | null;
+  linkedinUrl?: string | null;
+  website?: string | null;
+  city?: string | null;
+  state?: string | null;
+  streetAddress?: string | null;
+  addressFull?: string | null;
+  source?: string | null;
+  sourceUrl?: string | null;
+  sourceNotes?: string | null;
+}
+
+function nonBlank(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
+}
+
+function splitContactName(name: string | null | undefined): { firstName: string | null; lastName: string | null } {
+  const parts = (name ?? '').trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return { firstName: null, lastName: null };
+  return {
+    firstName: parts[0] ?? null,
+    lastName: parts.length > 1 ? parts.slice(1).join(' ') : null,
+  };
+}
+
+function manualLeadValues(
+  workspaceId: string,
+  account: GmailAccount,
+  email: string,
+  attendee: CalendarAttendee | undefined,
+  snapshot?: ManualLeadSnapshot | null,
+): typeof leads.$inferInsert {
+  const snapshotName = nonBlank(snapshot?.contactName);
+  const attendeeName = nonBlank(attendee?.name);
+  const contactName = snapshotName ?? attendeeName;
+  const split = splitContactName(contactName);
+  const inbound = workspaceId === INBOUND_WORKSPACE_ID;
+  return {
+    workspaceId,
+    gmailAccountId: account.id,
+    contactName,
+    firstName: nonBlank(snapshot?.firstName) ?? split.firstName,
+    lastName: nonBlank(snapshot?.lastName) ?? split.lastName,
+    companyName: nonBlank(snapshot?.companyName),
+    title: nonBlank(snapshot?.title),
+    segment: nonBlank(snapshot?.segment),
+    email,
+    phone: nonBlank(snapshot?.phone),
+    linkedinUrl: nonBlank(snapshot?.linkedinUrl),
+    website: nonBlank(snapshot?.website),
+    city: nonBlank(snapshot?.city),
+    state: nonBlank(snapshot?.state),
+    streetAddress: nonBlank(snapshot?.streetAddress),
+    addressFull: nonBlank(snapshot?.addressFull),
+    source: nonBlank(snapshot?.source) ?? 'manual_meeting',
+    sourceUrl: nonBlank(snapshot?.sourceUrl),
+    sourceNotes: nonBlank(snapshot?.sourceNotes) ?? 'Created automatically from a manually scheduled meeting.',
+    status: 'call_scheduled',
+    lifecycleStatus: 'active',
+    pipelineStage: inbound ? 'booked' : null,
+    importOrigin: inbound ? 'intake' : 'manual',
+    channel: 'email',
+    aiOwner: false,
+  };
+}
+
+function missingDetailPatch(
+  lead: typeof leads.$inferSelect,
+  values: Partial<typeof leads.$inferInsert>,
+): Partial<typeof leads.$inferInsert> {
+  const fields = [
+    'contactName',
+    'firstName',
+    'lastName',
+    'companyName',
+    'title',
+    'segment',
+    'phone',
+    'linkedinUrl',
+    'website',
+    'city',
+    'state',
+    'streetAddress',
+    'addressFull',
+    'sourceUrl',
+    'sourceNotes',
+  ] as const;
+  const patch: Partial<typeof leads.$inferInsert> = {};
+  for (const field of fields) {
+    if (!nonBlank(lead[field]) && nonBlank(values[field] as string | null | undefined)) {
+      patch[field] = values[field] as never;
+    }
+  }
+  if ((!lead.source || lead.source === 'manual_meeting') && values.source && values.source !== 'manual_meeting') {
+    patch.source = values.source;
+  }
+  return patch;
+}
+
+async function resolveOrCreateLeadForManualEvent(
+  workspaceId: string,
+  account: GmailAccount,
+  attendees: CalendarAttendee[],
+  requestedLeadId?: string | null,
+  snapshot?: ManualLeadSnapshot | null,
+): Promise<{ id: string; campaignId: string | null } | null> {
+  const db = getDb();
+  if (requestedLeadId) {
+    const [requested] = await db
+      .select()
+      .from(leads)
+      .where(and(eq(leads.id, requestedLeadId), isNull(leads.deletedAt)))
+      .limit(1);
+    if (requested?.workspaceId === workspaceId && requested.lifecycleStatus === 'active') {
+      return { id: requested.id, campaignId: requested.campaignId };
+    }
+  }
+
+  const accountEmail = account.email.trim().toLowerCase();
+  const attendee = attendees.find((a) => {
+    const email = a.email?.trim().toLowerCase();
+    return email && email !== accountEmail;
+  });
+  const email = attendee?.email?.trim().toLowerCase();
+  if (!email) return null;
+
+  const values = manualLeadValues(workspaceId, account, email, attendee, snapshot);
+  const existing = await db
+    .select()
+    .from(leads)
+    .where(
+      and(
+        eq(leads.workspaceId, workspaceId),
+        eq(leads.lifecycleStatus, 'active'),
+        isNull(leads.deletedAt),
+        sql`lower(${leads.email}) = ${email}`,
+      ),
+    )
+    .orderBy(desc(leads.updatedAt))
+    .limit(1);
+  if (existing[0]) {
+    const patch = missingDetailPatch(existing[0], values);
+    if (Object.keys(patch).length > 0) {
+      await db
+        .update(leads)
+        .set({ ...patch, updatedAt: new Date() })
+        .where(and(eq(leads.workspaceId, workspaceId), eq(leads.id, existing[0].id)));
+    }
+    return { id: existing[0].id, campaignId: existing[0].campaignId };
+  }
+
+  const [created] = await db
+    .insert(leads)
+    .values(values)
+    .returning({ id: leads.id, campaignId: leads.campaignId });
+  return created ?? null;
+}
+
 /**
  * Pull events from the account's primary Google Calendar (now-7d → now+60d)
  * and upsert them into calendar_events with source='google'.
@@ -69,49 +269,56 @@ export async function syncFromGoogle(workspaceId: string, gmailAccountId: string
   const timeMin = new Date(Date.now() - 7 * 86_400_000).toISOString();
   const timeMax = new Date(Date.now() + 60 * 86_400_000).toISOString();
 
-  const res = await cal.events.list({
-    calendarId: 'primary',
-    timeMin,
-    timeMax,
-    singleEvents: true,
-    orderBy: 'startTime',
-    maxResults: 250,
-  });
-
   const db = getDb();
   let synced = 0;
-  for (const ev of res.data.items ?? []) {
-    if (!ev.id) continue;
-    const startAt = toDate(ev.start);
-    const endAt = toDate(ev.end);
-    if (!startAt || !endAt) continue;
+  const seenGoogleEventIds: string[] = [];
+  let pageToken: string | undefined;
 
-    const attendees: CalendarAttendee[] = (ev.attendees ?? []).map((a) => ({
-      email: a.email ?? '',
-      name: a.displayName ?? undefined,
-      responseStatus: a.responseStatus ?? undefined,
-    }));
+  do {
+    const res = await cal.events.list({
+      calendarId: 'primary',
+      timeMin,
+      timeMax,
+      singleEvents: true,
+      orderBy: 'startTime',
+      maxResults: 2500,
+      showDeleted: true,
+      pageToken,
+    });
 
-    await db
-      .insert(calendarEvents)
-      .values({
-        workspaceId,
-        gmailAccountId: account.id,
-        googleEventId: ev.id,
-        googleCalendarId: 'primary',
-        title: ev.summary ?? '(no title)',
-        description: ev.description ?? null,
-        startAt,
-        endAt,
-        attendees,
-        meetLink: extractMeetLink(ev),
-        location: ev.location ?? null,
-        status: ev.status === 'cancelled' ? 'cancelled' : 'confirmed',
-        source: 'google',
-      })
-      .onConflictDoUpdate({
-        target: [calendarEvents.gmailAccountId, calendarEvents.googleEventId],
-        set: {
+    for (const ev of res.data.items ?? []) {
+      if (!ev.id) continue;
+      seenGoogleEventIds.push(ev.id);
+      const startAt = toDate(ev.start);
+      const endAt = toDate(ev.end);
+
+      if (ev.status === 'cancelled') {
+        await db
+          .update(calendarEvents)
+          .set({ status: 'cancelled', updatedAt: new Date() })
+          .where(and(eq(calendarEvents.gmailAccountId, account.id), eq(calendarEvents.googleEventId, ev.id)));
+        synced++;
+        continue;
+      }
+
+      if (!startAt || !endAt) continue;
+
+      const attendees: CalendarAttendee[] = (ev.attendees ?? []).map((a) => ({
+        email: a.email ?? '',
+        name: a.displayName ?? undefined,
+        responseStatus: a.responseStatus ?? undefined,
+      }));
+      const matchedLead = await findUniqueActiveLeadForAttendees(workspaceId, account.email, attendees);
+
+      await db
+        .insert(calendarEvents)
+        .values({
+          workspaceId,
+          gmailAccountId: account.id,
+          leadId: matchedLead?.id ?? null,
+          campaignId: matchedLead?.campaignId ?? null,
+          googleEventId: ev.id,
+          googleCalendarId: 'primary',
           title: ev.summary ?? '(no title)',
           description: ev.description ?? null,
           startAt,
@@ -119,13 +326,47 @@ export async function syncFromGoogle(workspaceId: string, gmailAccountId: string
           attendees,
           meetLink: extractMeetLink(ev),
           location: ev.location ?? null,
-          status: ev.status === 'cancelled' ? 'cancelled' : 'confirmed',
-          updatedAt: new Date(),
-        },
-      });
-    synced++;
-  }
-  return { synced };
+          status: 'confirmed',
+          source: 'google',
+        })
+        .onConflictDoUpdate({
+          target: [calendarEvents.gmailAccountId, calendarEvents.googleEventId],
+          set: {
+            title: ev.summary ?? '(no title)',
+            description: ev.description ?? null,
+            startAt,
+            endAt,
+            attendees,
+            leadId: sql`coalesce(${calendarEvents.leadId}, ${matchedLead?.id ?? null})` as never,
+            campaignId: sql`coalesce(${calendarEvents.campaignId}, ${matchedLead?.campaignId ?? null})` as never,
+            meetLink: extractMeetLink(ev),
+            location: ev.location ?? null,
+            status: 'confirmed',
+            updatedAt: new Date(),
+          },
+        });
+      synced++;
+    }
+
+    pageToken = res.data.nextPageToken ?? undefined;
+  } while (pageToken);
+
+  const staleFilters = [
+    eq(calendarEvents.workspaceId, workspaceId),
+    eq(calendarEvents.gmailAccountId, account.id),
+    eq(calendarEvents.googleCalendarId, 'primary'),
+    eq(calendarEvents.source, 'google'),
+    ne(calendarEvents.status, 'cancelled'),
+    between(calendarEvents.startAt, new Date(timeMin), new Date(timeMax)),
+    ...(seenGoogleEventIds.length > 0 ? [notInArray(calendarEvents.googleEventId, seenGoogleEventIds)] : []),
+  ];
+  const stale = await db
+    .update(calendarEvents)
+    .set({ status: 'cancelled', updatedAt: new Date() })
+    .where(and(...staleFilters))
+    .returning({ id: calendarEvents.id });
+
+  return { synced: synced + stale.length };
 }
 
 /** Sync every active account on the workspace; tolerant of per-account failures. */
@@ -185,6 +426,7 @@ export interface CreateEventInput {
   attendees?: CalendarAttendee[];
   leadId?: string | null;
   campaignId?: string | null;
+  leadSnapshot?: ManualLeadSnapshot | null;
   emailThreadId?: string | null;
   location?: string;
   withMeet?: boolean;
@@ -197,6 +439,13 @@ export async function createEvent(workspaceId: string, input: CreateEventInput):
   const auth = await authClientForAccount(account);
   const cal = calendarClient(auth);
   const withMeet = input.withMeet !== false; // default on
+  const linkedLead = await resolveOrCreateLeadForManualEvent(
+    workspaceId,
+    account,
+    input.attendees ?? [],
+    input.leadId,
+    input.leadSnapshot,
+  );
 
   const res = await cal.events.insert({
     calendarId: 'primary',
@@ -209,6 +458,14 @@ export async function createEvent(workspaceId: string, input: CreateEventInput):
       start: { dateTime: input.startAt.toISOString() },
       end: { dateTime: input.endAt.toISOString() },
       attendees: (input.attendees ?? []).map((a) => ({ email: a.email, displayName: a.name })),
+      reminders: {
+        useDefault: false,
+        overrides: [
+          { method: 'email', minutes: 24 * 60 },
+          { method: 'popup', minutes: 60 },
+          { method: 'popup', minutes: 10 },
+        ],
+      },
       conferenceData: withMeet
         ? { createRequest: { requestId: randomUUID(), conferenceSolutionKey: { type: 'hangoutsMeet' } } }
         : undefined,
@@ -222,8 +479,8 @@ export async function createEvent(workspaceId: string, input: CreateEventInput):
     .values({
       workspaceId,
       gmailAccountId: account.id,
-      leadId: input.leadId ?? null,
-      campaignId: input.campaignId ?? null,
+      leadId: linkedLead?.id ?? null,
+      campaignId: linkedLead?.campaignId ?? input.campaignId ?? null,
       emailThreadId: input.emailThreadId ?? null,
       googleEventId: ev.id ?? null,
       googleCalendarId: 'primary',
@@ -323,6 +580,686 @@ export async function bulkCancelEvents(
     )
     .returning({ id: calendarEvents.id });
   return { cancelled: result.length };
+}
+
+export type MeetingOutcome = 'success' | 'failure';
+export type OutcomeReason = 'no_show' | 'bad_fit' | 'budget' | 'timing' | 'competitor';
+export type OutcomeNextAction =
+  | 'schedule_follow_up'
+  | 'send_proposal'
+  | 'move_to_contracting'
+  | 'close_won'
+  | 'attempt_reschedule'
+  | 'nurture';
+
+export interface PostCallPendingEvent {
+  event: CalendarEvent;
+  lead: {
+    id: string;
+    contactName: string | null;
+    companyName: string | null;
+    email: string;
+    pipelineStage: string | null;
+  } | null;
+}
+
+function canManageOutcome(
+  account: Pick<GmailAccount, 'connectedByUserId'>,
+  userId: string,
+  role: WorkspaceRole,
+): boolean {
+  if (account.connectedByUserId) return account.connectedByUserId === userId;
+  return role === 'owner' || role === 'admin';
+}
+
+function outcomeBaseFilters(workspaceId: string, now: Date, includeSnoozed: boolean) {
+  return [
+    eq(calendarEvents.workspaceId, workspaceId),
+    ne(calendarEvents.status, 'cancelled'),
+    lte(calendarEvents.endAt, now),
+    isNull(calendarEvents.outcomeLoggedAt),
+    sql`${calendarEvents.leadId} is not null`,
+    ...(includeSnoozed
+      ? []
+      : [or(isNull(calendarEvents.outcomeSnoozedUntil), lte(calendarEvents.outcomeSnoozedUntil, now))!]),
+  ];
+}
+
+export async function listPendingOutcomes(
+  workspaceId: string,
+  userId: string,
+  role: WorkspaceRole,
+  opts: { includeSnoozed?: boolean; limit?: number } = {},
+): Promise<{ events: PostCallPendingEvent[]; count: number }> {
+  const db = getDb();
+  const now = new Date();
+  const rows = await db
+    .select({ event: calendarEvents, account: gmailAccounts, lead: leads })
+    .from(calendarEvents)
+    .innerJoin(gmailAccounts, eq(calendarEvents.gmailAccountId, gmailAccounts.id))
+    .leftJoin(leads, eq(calendarEvents.leadId, leads.id))
+    .where(and(...outcomeBaseFilters(workspaceId, now, opts.includeSnoozed === true)))
+    .orderBy(asc(calendarEvents.endAt))
+    .limit(Math.min(Math.max(opts.limit ?? 25, 1), 100));
+
+  const visible = rows
+    .filter((r) => canManageOutcome(r.account, userId, role))
+    .map((r) => ({
+      event: r.event,
+      lead: r.lead
+        ? {
+            id: r.lead.id,
+            contactName: r.lead.contactName,
+            companyName: r.lead.companyName,
+            email: r.lead.email,
+            pipelineStage: r.lead.pipelineStage,
+          }
+        : null,
+    }));
+  return { events: visible, count: visible.length };
+}
+
+async function getOutcomeEventForUser(
+  workspaceId: string,
+  eventId: string,
+  userId: string,
+  role: WorkspaceRole,
+): Promise<{ event: CalendarEvent; account: GmailAccount; lead: typeof leads.$inferSelect | null }> {
+  const db = getDb();
+  const [row] = await db
+    .select({ event: calendarEvents, account: gmailAccounts, lead: leads })
+    .from(calendarEvents)
+    .innerJoin(gmailAccounts, eq(calendarEvents.gmailAccountId, gmailAccounts.id))
+    .leftJoin(leads, eq(calendarEvents.leadId, leads.id))
+    .where(and(eq(calendarEvents.workspaceId, workspaceId), eq(calendarEvents.id, eventId)))
+    .limit(1);
+  if (!row) throw new NotFoundError('Calendar event not found');
+  if (!canManageOutcome(row.account, userId, role)) {
+    throw new ForbiddenError('Only the meeting host can log this outcome');
+  }
+  return row;
+}
+
+async function pendingCountForUser(workspaceId: string, userId: string, role: WorkspaceRole): Promise<number> {
+  return (await listPendingOutcomes(workspaceId, userId, role, { limit: 100 })).count;
+}
+
+function requireNotes(notes: string) {
+  if (!notes.trim()) {
+    throw new ValidationError('Meeting notes are required', [
+      { field: 'notes', reason: 'Add the call notes before logging the outcome' },
+    ]);
+  }
+}
+
+function outcomeNoteBody(input: {
+  outcome: MeetingOutcome;
+  reason?: OutcomeReason | null;
+  notes: string;
+  nextAction?: OutcomeNextAction | null;
+  meetTranscriptText?: string | null;
+  meetNotesText?: string | null;
+}): string {
+  const parts = [
+    `Outcome: ${input.outcome}`,
+    input.reason ? `Reason: ${input.reason}` : null,
+    input.nextAction ? `Next action: ${input.nextAction}` : null,
+    '',
+    input.notes.trim(),
+  ].filter((v): v is string => v !== null);
+  if (input.meetNotesText) {
+    parts.push('', 'Google Meet notes:', input.meetNotesText.slice(0, 4000));
+  }
+  if (input.meetTranscriptText) {
+    parts.push('', 'Google Meet transcript excerpt:', input.meetTranscriptText.slice(0, 4000));
+  }
+  return parts.join('\n');
+}
+
+export async function logOutcome(
+  workspaceId: string,
+  eventId: string,
+  userId: string,
+  role: WorkspaceRole,
+  input: {
+    outcome: MeetingOutcome;
+    notes: string;
+    reason?: OutcomeReason | null;
+    nextAction?: OutcomeNextAction | null;
+    followUp?: { title?: string; startAt: Date; endAt: Date } | null;
+  },
+): Promise<{ event: CalendarEvent; pendingCount: number }> {
+  requireNotes(input.notes);
+  const { event, lead } = await getOutcomeEventForUser(workspaceId, eventId, userId, role);
+  if (!event.leadId || !lead) throw new ConflictError('This meeting is not linked to a lead');
+  if (event.outcomeLoggedAt) {
+    return { event, pendingCount: await pendingCountForUser(workspaceId, userId, role) };
+  }
+  if (input.outcome === 'failure' && !input.reason) {
+    throw new ValidationError('Failure reason is required', [
+      { field: 'reason', reason: 'Choose why the meeting did not move forward' },
+    ]);
+  }
+  if (input.outcome === 'success' && !input.nextAction) {
+    throw new ValidationError('Next action is required', [
+      { field: 'nextAction', reason: 'Choose the next action for a successful meeting' },
+    ]);
+  }
+
+  let nextStepTaskId: string | null = null;
+  let nextStepCalendarEventId: string | null = null;
+  const who = lead.contactName || lead.companyName || lead.email;
+
+  if (input.outcome === 'success') {
+    if (input.nextAction === 'schedule_follow_up' && input.followUp) {
+      const followUp = await createEvent(workspaceId, {
+        gmailAccountId: event.gmailAccountId,
+        title: input.followUp.title || `Follow-up call · ${who}`,
+        description: `Follow-up from ${event.title}`,
+        startAt: input.followUp.startAt,
+        endAt: input.followUp.endAt,
+        attendees: [{ email: lead.email, name: lead.contactName ?? undefined }],
+        leadId: lead.id,
+        campaignId: lead.campaignId,
+        emailThreadId: event.emailThreadId,
+        withMeet: true,
+        source: 'app',
+      });
+      nextStepCalendarEventId = followUp.id;
+    } else if (input.nextAction === 'send_proposal') {
+      const task = await salesTask.create({
+        workspaceId,
+        leadId: lead.id,
+        title: `Send proposal to ${who}`,
+        type: 'send_proposal',
+        priority: 'high',
+        dueAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+        ownerUserId: userId,
+      });
+      nextStepTaskId = task.id;
+      await updateLeadStage(workspaceId, lead.id, { pipelineStage: 'opportunity' });
+    } else if (input.nextAction === 'move_to_contracting') {
+      const task = await salesTask.create({
+        workspaceId,
+        leadId: lead.id,
+        title: `Move ${who} to contracting`,
+        type: 'human_handoff',
+        priority: 'high',
+        ownerUserId: userId,
+      });
+      nextStepTaskId = task.id;
+      await updateLeadStage(workspaceId, lead.id, { pipelineStage: 'opportunity' });
+    } else if (input.nextAction === 'close_won') {
+      await updateLeadStage(workspaceId, lead.id, {
+        pipelineStage: 'won',
+        lifecycleStatus: 'closed',
+        closeReason: 'won_after_meeting',
+        closedAt: new Date(),
+      });
+      await notify.emit({
+        workspaceId,
+        userId,
+        leadId: lead.id,
+        kind: 'won',
+        priority: 'high',
+        title: `Closed won — ${who}`,
+        body: event.title,
+      });
+    }
+  } else {
+    if (input.reason === 'bad_fit' || input.reason === 'competitor') {
+      await updateLeadStage(workspaceId, lead.id, {
+        pipelineStage: 'lost',
+        lifecycleStatus: 'closed',
+        closeReason: input.reason,
+        closedAt: new Date(),
+      });
+    } else if (input.reason === 'budget' || input.reason === 'timing' || input.nextAction === 'nurture') {
+      const dueAt = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
+      const task = await salesTask.create({
+        workspaceId,
+        leadId: lead.id,
+        title: `Nurture ${who}`,
+        type: 'follow_up_manual',
+        priority: 'med',
+        dueAt,
+        ownerUserId: userId,
+      });
+      nextStepTaskId = task.id;
+      await updateLeadStage(workspaceId, lead.id, {
+        pipelineStage: 'nurture_later',
+        nextActionAt: dueAt,
+      });
+    } else if (input.reason === 'no_show' || input.nextAction === 'attempt_reschedule') {
+      if (input.followUp) {
+        // Operator booked the next meeting straight from the post-call panel —
+        // create the calendar invite instead of a "call them back" task.
+        const followUp = await createEvent(workspaceId, {
+          gmailAccountId: event.gmailAccountId,
+          title: input.followUp.title || `Reschedule · ${who}`,
+          description: `Reschedule of ${event.title}`,
+          startAt: input.followUp.startAt,
+          endAt: input.followUp.endAt,
+          attendees: [{ email: lead.email, name: lead.contactName ?? undefined }],
+          leadId: lead.id,
+          campaignId: lead.campaignId,
+          emailThreadId: event.emailThreadId,
+          withMeet: true,
+          source: 'app',
+        });
+        nextStepCalendarEventId = followUp.id;
+      } else {
+        const task = await salesTask.create({
+          workspaceId,
+          leadId: lead.id,
+          title: `Attempt reschedule with ${who}`,
+          type: 'call_lead',
+          priority: 'high',
+          dueAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+          ownerUserId: userId,
+        });
+        nextStepTaskId = task.id;
+      }
+    }
+  }
+
+  const db = getDb();
+  const [updated] = await db
+    .update(calendarEvents)
+    .set({
+      outcomeStatus: input.reason === 'no_show' ? 'no_show' : 'completed',
+      meetingOutcome: input.outcome,
+      outcomeReason: input.reason ?? null,
+      outcomeNotes: input.notes.trim(),
+      outcomeNextAction: input.nextAction ?? null,
+      outcomeLoggedAt: new Date(),
+      outcomeLoggedByUserId: userId,
+      outcomeSnoozedUntil: null,
+      nextStepTaskId,
+      nextStepCalendarEventId,
+      updatedAt: new Date(),
+    })
+    .where(eq(calendarEvents.id, event.id))
+    .returning();
+  if (!updated) throw new Error('logOutcome: update returned no row');
+
+  if (event.outcomeTaskId) {
+    await salesTask.complete(workspaceId, event.outcomeTaskId, userId).catch(() => undefined);
+  }
+
+  await salesNote.create({
+    workspaceId,
+    leadId: lead.id,
+    kind: 'post_call',
+    title: `Post-call outcome · ${event.title}`,
+    body: outcomeNoteBody({
+      outcome: input.outcome,
+      reason: input.reason,
+      nextAction: input.nextAction,
+      notes: input.notes,
+      meetNotesText: event.meetNotesText,
+      meetTranscriptText: event.meetTranscriptText,
+    }),
+    authorUserId: userId,
+  });
+
+  await salesActivity.emit({
+    workspaceId,
+    leadId: lead.id,
+    campaignId: lead.campaignId,
+    activityType: 'meeting_outcome_logged',
+    title: input.outcome === 'success' ? 'Meeting logged as successful' : 'Meeting logged as failed',
+    description: input.reason ?? input.nextAction ?? null,
+    metadata: {
+      event_id: event.id,
+      outcome: input.outcome,
+      reason: input.reason ?? null,
+      next_action: input.nextAction ?? null,
+      next_step_task_id: nextStepTaskId,
+      next_step_calendar_event_id: nextStepCalendarEventId,
+    },
+    createdBy: userId,
+  });
+
+  return { event: updated, pendingCount: await pendingCountForUser(workspaceId, userId, role) };
+}
+
+async function updateLeadStage(
+  workspaceId: string,
+  leadId: string,
+  patch: Partial<Pick<typeof leads.$inferInsert, 'pipelineStage' | 'lifecycleStatus' | 'closeReason' | 'closedAt' | 'nextActionAt'>>,
+) {
+  const db = getDb();
+  await db
+    .update(leads)
+    .set({ ...patch, updatedAt: new Date() })
+    .where(and(eq(leads.workspaceId, workspaceId), eq(leads.id, leadId)));
+}
+
+export async function snoozeOutcome(
+  workspaceId: string,
+  eventId: string,
+  userId: string,
+  role: WorkspaceRole,
+  untilAt: Date,
+): Promise<{ event: CalendarEvent; taskId: string | null; pendingCount: number }> {
+  const { event, lead } = await getOutcomeEventForUser(workspaceId, eventId, userId, role);
+  if (!event.leadId || !lead) throw new ConflictError('This meeting is not linked to a lead');
+  let taskId = event.outcomeTaskId;
+  if (!taskId) {
+    const who = lead.contactName || lead.companyName || lead.email;
+    const task = await salesTask.create({
+      workspaceId,
+      leadId: lead.id,
+      title: `Log meeting outcome — ${who}`,
+      type: 'post_call_outcome',
+      priority: 'high',
+      dueAt: untilAt,
+      ownerUserId: userId,
+    });
+    taskId = task.id;
+  } else {
+    await dbUpdateTaskDue(workspaceId, taskId, untilAt);
+  }
+  const db = getDb();
+  const [updated] = await db
+    .update(calendarEvents)
+    .set({ outcomeSnoozedUntil: untilAt, outcomeTaskId: taskId, updatedAt: new Date() })
+    .where(eq(calendarEvents.id, event.id))
+    .returning();
+  if (!updated) throw new Error('snoozeOutcome: update returned no row');
+  return { event: updated, taskId, pendingCount: await pendingCountForUser(workspaceId, userId, role) };
+}
+
+export async function ignoreOutcome(
+  workspaceId: string,
+  eventId: string,
+  userId: string,
+  role: WorkspaceRole,
+): Promise<{ event: CalendarEvent; pendingCount: number }> {
+  const { event } = await getOutcomeEventForUser(workspaceId, eventId, userId, role);
+  if (event.outcomeLoggedAt) {
+    return { event, pendingCount: await pendingCountForUser(workspaceId, userId, role) };
+  }
+  const db = getDb();
+  const [updated] = await db
+    .update(calendarEvents)
+    .set({
+      outcomeStatus: 'ignored',
+      meetingOutcome: null,
+      outcomeReason: 'ignored',
+      outcomeNotes: null,
+      outcomeNextAction: null,
+      outcomeLoggedAt: new Date(),
+      outcomeLoggedByUserId: userId,
+      outcomeSnoozedUntil: null,
+      updatedAt: new Date(),
+    })
+    .where(eq(calendarEvents.id, event.id))
+    .returning();
+  if (!updated) throw new Error('ignoreOutcome: update returned no row');
+
+  if (event.outcomeTaskId) {
+    await salesTask.complete(workspaceId, event.outcomeTaskId, userId).catch(() => undefined);
+  }
+
+  return { event: updated, pendingCount: await pendingCountForUser(workspaceId, userId, role) };
+}
+
+async function dbUpdateTaskDue(workspaceId: string, taskId: string, dueAt: Date) {
+  const db = getDb();
+  await db
+    .update(salesTasks)
+    .set({ status: 'open', dueAt })
+    .where(and(eq(salesTasks.workspaceId, workspaceId), eq(salesTasks.id, taskId)));
+}
+
+export async function endMeetingNow(
+  workspaceId: string,
+  eventId: string,
+  userId: string,
+  role: WorkspaceRole,
+): Promise<{ event: CalendarEvent; pendingCount: number }> {
+  const { event } = await getOutcomeEventForUser(workspaceId, eventId, userId, role);
+  const now = new Date();
+  const endAt = now > event.startAt ? now : event.endAt;
+  const updated = await updateEvent(workspaceId, event.id, { endAt });
+  return { event: updated, pendingCount: await pendingCountForUser(workspaceId, userId, role) };
+}
+
+function extractMeetCode(meetLink: string | null): string | null {
+  if (!meetLink) return null;
+  const m = meetLink.match(/meet\.google\.com\/([a-z]{3}-[a-z]{4}-[a-z]{3})/i);
+  return m?.[1]?.toLowerCase() ?? null;
+}
+
+export async function syncMeetArtifacts(
+  workspaceId: string,
+  eventId: string,
+  opts: { userId?: string; role?: WorkspaceRole } = {},
+): Promise<{ event: CalendarEvent; transcriptChars: number; notesChars: number }> {
+  const row = opts.userId && opts.role
+    ? await getOutcomeEventForUser(workspaceId, eventId, opts.userId, opts.role)
+    : await getEventWithAccount(workspaceId, eventId);
+  const { event, account, lead } = row;
+  const meetCode = extractMeetCode(event.meetLink);
+  if (!meetCode) {
+    const updated = await setMeetArtifactState(event.id, {
+      meetArtifactStatus: 'no_meet',
+      meetArtifactSyncedAt: new Date(),
+      meetArtifactError: null,
+    });
+    return { event: updated, transcriptChars: 0, notesChars: 0 };
+  }
+
+  try {
+    const auth = await authClientForAccount(account);
+    const artifacts = await fetchMeetArtifacts(auth, meetCode);
+    const updated = await setMeetArtifactState(event.id, {
+      meetConferenceRecord: artifacts.conferenceRecord,
+      meetArtifactStatus: artifacts.transcriptText || artifacts.notesText ? 'synced' : 'no_artifacts',
+      meetTranscriptText: artifacts.transcriptText || null,
+      meetNotesText: artifacts.notesText || null,
+      meetArtifactSyncedAt: new Date(),
+      meetArtifactError: null,
+    });
+    if ((artifacts.transcriptText || artifacts.notesText) && lead && event.meetArtifactStatus !== 'synced') {
+      await salesNote.create({
+        workspaceId,
+        leadId: lead.id,
+        kind: 'post_call',
+        title: `Google Meet notes · ${event.title}`,
+        body: [
+          artifacts.notesText ? `Notes:\n${artifacts.notesText.slice(0, 6000)}` : null,
+          artifacts.transcriptText ? `Transcript excerpt:\n${artifacts.transcriptText.slice(0, 6000)}` : null,
+        ].filter(Boolean).join('\n\n'),
+        authorUserId: opts.userId ?? null,
+      }).catch(() => undefined);
+    }
+    return {
+      event: updated,
+      transcriptChars: artifacts.transcriptText.length,
+      notesChars: artifacts.notesText.length,
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const updated = await setMeetArtifactState(event.id, {
+      meetArtifactStatus: 'error',
+      meetArtifactSyncedAt: new Date(),
+      meetArtifactError: message.slice(0, 1000),
+    });
+    return { event: updated, transcriptChars: 0, notesChars: 0 };
+  }
+}
+
+async function getEventWithAccount(
+  workspaceId: string,
+  eventId: string,
+): Promise<{ event: CalendarEvent; account: GmailAccount; lead: typeof leads.$inferSelect | null }> {
+  const db = getDb();
+  const [row] = await db
+    .select({ event: calendarEvents, account: gmailAccounts, lead: leads })
+    .from(calendarEvents)
+    .innerJoin(gmailAccounts, eq(calendarEvents.gmailAccountId, gmailAccounts.id))
+    .leftJoin(leads, eq(calendarEvents.leadId, leads.id))
+    .where(and(eq(calendarEvents.workspaceId, workspaceId), eq(calendarEvents.id, eventId)))
+    .limit(1);
+  if (!row) throw new NotFoundError('Calendar event not found');
+  return row;
+}
+
+async function setMeetArtifactState(
+  eventId: string,
+  patch: Partial<Pick<CalendarEvent,
+    'meetConferenceRecord' | 'meetArtifactStatus' | 'meetTranscriptText' | 'meetNotesText' | 'meetArtifactSyncedAt' | 'meetArtifactError'
+  >>,
+): Promise<CalendarEvent> {
+  const db = getDb();
+  const [updated] = await db
+    .update(calendarEvents)
+    .set({ ...patch, updatedAt: new Date() })
+    .where(eq(calendarEvents.id, eventId))
+    .returning();
+  if (!updated) throw new Error('setMeetArtifactState: update returned no row');
+  return updated;
+}
+
+async function fetchMeetArtifacts(
+  auth: Auth.OAuth2Client,
+  meetCode: string,
+): Promise<{ conferenceRecord: string | null; transcriptText: string; notesText: string }> {
+  const meet = (google as unknown as { meet: (opts: unknown) => unknown }).meet({ version: 'v2', auth }) as {
+    conferenceRecords: {
+      list: (opts: { filter?: string; pageSize?: number }) => Promise<{ data: { conferenceRecords?: Array<{ name?: string }> } }>;
+      transcripts: {
+        list: (opts: { parent: string; pageSize?: number }) => Promise<{ data: { transcripts?: Array<{ name?: string }> } }>;
+        entries: {
+          list: (opts: { parent: string; pageSize?: number; pageToken?: string }) => Promise<{ data: { transcriptEntries?: Array<{ text?: string; participant?: string }>; nextPageToken?: string } }>;
+        };
+      };
+    };
+  };
+  const filters = [
+    `space.meeting_code = "${meetCode}"`,
+    `meeting_code = "${meetCode}"`,
+  ];
+  let conferenceRecord: string | null = null;
+  for (const filter of filters) {
+    try {
+      const res = await meet.conferenceRecords.list({ filter, pageSize: 1 });
+      conferenceRecord = res.data.conferenceRecords?.[0]?.name ?? null;
+      if (conferenceRecord) break;
+    } catch {
+      // Try the next documented/legacy filter spelling.
+    }
+  }
+  if (!conferenceRecord) return { conferenceRecord: null, transcriptText: '', notesText: '' };
+
+  let transcriptText = '';
+  try {
+    const transcripts = await meet.conferenceRecords.transcripts.list({
+      parent: conferenceRecord,
+      pageSize: 10,
+    });
+    const transcriptName = transcripts.data.transcripts?.[0]?.name;
+    if (transcriptName) {
+      let pageToken: string | undefined;
+      const lines: string[] = [];
+      do {
+        const entries = await meet.conferenceRecords.transcripts.entries.list({
+          parent: transcriptName,
+          pageSize: 1000,
+          pageToken,
+        });
+        for (const entry of entries.data.transcriptEntries ?? []) {
+          if (entry.text) lines.push(entry.text);
+        }
+        pageToken = entries.data.nextPageToken ?? undefined;
+      } while (pageToken);
+      transcriptText = lines.join('\n');
+    }
+  } catch {
+    transcriptText = '';
+  }
+
+  const notesText = await fetchMeetSmartNotes(auth, conferenceRecord).catch(() => '');
+  return { conferenceRecord, transcriptText, notesText };
+}
+
+async function fetchMeetSmartNotes(auth: Auth.OAuth2Client, conferenceRecord: string): Promise<string> {
+  const meetBeta = (google as unknown as { meet: (opts: unknown) => unknown }).meet({ version: 'v2beta', auth }) as {
+    conferenceRecords?: {
+      smartNotes?: {
+        list: (opts: { parent: string; pageSize?: number }) => Promise<{ data: { smartNotes?: Array<{ document?: string; documentId?: string; name?: string }> } }>;
+      };
+    };
+  };
+  const smartNotes = await meetBeta.conferenceRecords?.smartNotes?.list({ parent: conferenceRecord, pageSize: 1 });
+  const note = smartNotes?.data.smartNotes?.[0];
+  const docId = note?.documentId ?? note?.document?.match(/documents\/([^/]+)/)?.[1] ?? null;
+  if (!docId) return '';
+  const docs = google.docs({ version: 'v1', auth });
+  const doc = await docs.documents.get({ documentId: docId });
+  const pieces: string[] = [];
+  for (const block of doc.data.body?.content ?? []) {
+    for (const el of block.paragraph?.elements ?? []) {
+      const text = el.textRun?.content;
+      if (text) pieces.push(text);
+    }
+  }
+  return pieces.join('').trim();
+}
+
+export async function scanPostCallOutcomes(): Promise<number> {
+  const db = getDb();
+  const now = new Date();
+  const rows = await db
+    .select({ event: calendarEvents, account: gmailAccounts, lead: leads })
+    .from(calendarEvents)
+    .innerJoin(gmailAccounts, eq(calendarEvents.gmailAccountId, gmailAccounts.id))
+    .leftJoin(leads, eq(calendarEvents.leadId, leads.id))
+    .where(
+      and(
+        ...outcomeBaseFilters('', now, false).filter((_v, idx) => idx !== 0),
+        isNull(calendarEvents.outcomeTaskId),
+      ),
+    )
+    .orderBy(asc(calendarEvents.endAt))
+    .limit(100);
+
+  let created = 0;
+  for (const row of rows) {
+    if (!row.lead) continue;
+    const ownerUserId = row.account.connectedByUserId;
+    const who = row.lead.contactName || row.lead.companyName || row.lead.email;
+    const task = await salesTask.create({
+      workspaceId: row.event.workspaceId,
+      leadId: row.lead.id,
+      title: `Log meeting outcome — ${who}`,
+      type: 'post_call_outcome',
+      priority: 'high',
+      dueAt: now,
+      ownerUserId,
+      source: 'manual',
+    });
+    await db
+      .update(calendarEvents)
+      .set({ outcomeTaskId: task.id, updatedAt: now })
+      .where(eq(calendarEvents.id, row.event.id));
+    await syncMeetArtifacts(row.event.workspaceId, row.event.id).catch(() => undefined);
+    await notify.emit({
+      workspaceId: row.event.workspaceId,
+      userId: ownerUserId ?? null,
+      leadId: row.lead.id,
+      kind: 'task',
+      priority: 'high',
+      title: `Log meeting outcome — ${who}`,
+      body: row.event.title,
+      meta: row.event.endAt.toISOString(),
+    });
+    created++;
+  }
+  return created;
 }
 
 /**

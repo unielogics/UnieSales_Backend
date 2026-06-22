@@ -56,6 +56,7 @@ const INTAKE_ROUTES_BY_SITE: Record<string, string[]> = {
   uniecortex: [
     'uniecortex.com/audit (HMAC mirror)',
     'uniecortex.com/partners (HMAC mirror)',
+    'api.uniesales.com/public/sales-intake/unieconnect-catalog-audit (HMAC mirror)',
   ],
   unieconnect: [
     // No public intake forms yet — operator is training ahead of launch.

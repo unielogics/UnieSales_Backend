@@ -100,7 +100,7 @@ export async function listForWorkspace(
     const intakeLeads = db
       .select({ id: leads.id })
       .from(leads)
-      .where(and(eq(leads.workspaceId, workspaceId), eq(leads.importOrigin, 'intake')));
+      .where(and(eq(leads.workspaceId, workspaceId), inArray(leads.importOrigin, ['intake', 'sales_manual'])));
     conds.push(inArray(salesActivities.leadId, intakeLeads));
   } else if (opts.origin === 'outbound') {
     const outboundLeads = db
@@ -109,7 +109,7 @@ export async function listForWorkspace(
       .where(
         and(
           eq(leads.workspaceId, workspaceId),
-          or(isNull(leads.importOrigin), ne(leads.importOrigin, 'intake'))!,
+          or(isNull(leads.importOrigin), sql`${leads.importOrigin} NOT IN ('intake', 'sales_manual')`)!,
         ),
       );
     conds.push(

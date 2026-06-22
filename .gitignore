@@ -12,3 +12,6 @@ coverage/
 tmp/
 *.pem
 *.key
+
+# Compiled-output backups (local only — never tracked)
+dist_backup_*

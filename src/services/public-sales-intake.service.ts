@@ -62,9 +62,12 @@ export async function submitCatalogAuditSalesIntake(
   const companyName = stringOrNull(fields.company) || body.contact.company?.trim() || null;
   const confidence = numberOrNull(fields.confidence);
   const productCount = numberOrNull(fields.product_count);
+  const originalTag = stringOrNull(meta.original_tag) || body.tag;
   const customFields = {
     site: 'unieconnect',
     tag: body.tag,
+    original_tag: originalTag,
+    source: SOURCE,
     page_url: body.page_url,
     contact: body.contact,
     fields,
@@ -97,39 +100,56 @@ export async function submitCatalogAuditSalesIntake(
   const [lead] = await db.insert(leads).values(insertValues).returning({ id: leads.id });
   if (!lead) throw new Error('catalogAuditSalesIntake: insert returned no row');
 
-  await activity.emit({
-    workspaceId: INTAKE_WORKSPACE_ID,
-    leadId: lead.id,
-    campaignId: null,
-    activityType: 'intake_received',
-    title: reference ? `UnieConnect CAT audit ${reference}` : 'UnieConnect catalog audit',
-    description: `${companyName || contactName} submitted a public fulfillment snapshot.`,
-    metadata: {
-      source: SOURCE,
-      cortex_reference: reference,
-      website,
-      product_count: productCount,
-      confidence,
-    },
-    createdBy: 'system',
-  });
+  try {
+    await activity.emit({
+      workspaceId: INTAKE_WORKSPACE_ID,
+      leadId: lead.id,
+      campaignId: null,
+      activityType: 'intake_received',
+      title: reference ? `UnieConnect CAT audit ${reference}` : 'UnieConnect catalog audit',
+      description: `${companyName || contactName} submitted a public fulfillment snapshot.`,
+      metadata: {
+        source: SOURCE,
+        original_tag: originalTag,
+        cortex_reference: reference,
+        website,
+        product_count: productCount,
+        confidence,
+      },
+      createdBy: 'system',
+    });
+  } catch (err) {
+    // Best-effort: never make Cortex retry after the lead was persisted.
+    // eslint-disable-next-line no-console
+    console.warn('catalogAuditSalesIntake: activity emit failed', err);
+  }
 
-  await notes.create({
-    workspaceId: INTAKE_WORKSPACE_ID,
-    leadId: lead.id,
-    kind: 'intake_summary',
-    title: reference ? `Catalog audit summary · ${reference}` : 'Catalog audit summary',
-    body: buildSummary(body, reference),
-  });
+  try {
+    await notes.create({
+      workspaceId: INTAKE_WORKSPACE_ID,
+      leadId: lead.id,
+      kind: 'intake_summary',
+      title: reference ? `Catalog audit summary · ${reference}` : 'Catalog audit summary',
+      body: buildSummary(body, reference),
+    });
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('catalogAuditSalesIntake: note create failed', err);
+  }
 
-  await tasks.create({
-    workspaceId: INTAKE_WORKSPACE_ID,
-    leadId: lead.id,
-    title: reference ? `Review UnieConnect CAT audit lead · ${reference}` : 'Review UnieConnect CAT audit lead',
-    type: 'review_form_submission',
-    priority: confidence != null && confidence >= 70 ? 'high' : 'med',
-    source: 'AI',
-  });
+  try {
+    await tasks.create({
+      workspaceId: INTAKE_WORKSPACE_ID,
+      leadId: lead.id,
+      title: reference ? `Review UnieConnect CAT audit lead · ${reference}` : 'Review UnieConnect CAT audit lead',
+      type: 'review_form_submission',
+      priority: confidence != null && confidence >= 70 ? 'high' : 'med',
+      source: 'AI',
+    });
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('catalogAuditSalesIntake: task create failed', err);
+  }
 
   return { lead_id: lead.id, status: 'created' };
 }

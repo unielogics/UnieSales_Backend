@@ -55,14 +55,6 @@ const CortexSchema = z.object({
   meta: z.record(z.unknown()).optional().default({}),
 });
 
-const CatalogAuditSchema = z.object({
-  tag: z.literal('website_catalog_audit').optional().default('website_catalog_audit'),
-  page_url: z.string().url().max(2000),
-  contact: ContactSchema,
-  fields: z.record(z.unknown()).optional().default({}),
-  meta: z.record(z.unknown()).optional().default({}),
-});
-
 function clientIpFrom(req: FastifyRequest): string | undefined {
   const xff = req.headers['x-forwarded-for'];
   if (typeof xff === 'string' && xff) return xff.split(',')[0]!.trim();
@@ -201,33 +193,6 @@ export async function registerPublicIntakeRoutes(app: FastifyInstance): Promise<
         const result = await intake.submit({
           site: 'uniecortex',
           body: parsed.data,
-          clientIp: clientIpFrom(req),
-          userAgent: userAgentFrom(req),
-        });
-        reply.code(201);
-        return result;
-      },
-    );
-
-    // ---- UnieConnect catalog audit — native Sales receiver for Cortex mirror ----
-    instance.post(
-      '/api/public/sales-intake/unieconnect-catalog-audit',
-      rateLimitConfig(60),
-      async (req, reply) => {
-        if (!verifySignedCortexRequest(req, reply)) return { error: reply.statusCode === 401 ? 'invalid signature' : 'server misconfigured' };
-        const parsed = CatalogAuditSchema.safeParse(req.body);
-        if (!parsed.success) {
-          throw new ValidationError(
-            'Validation failed',
-            parsed.error.issues.map((i) => ({ field: i.path.join('.'), reason: i.message })),
-          );
-        }
-        const result = await intake.submit({
-          site: 'uniecortex',
-          body: {
-            ...parsed.data,
-            tag: 'website_catalog_audit',
-          },
           clientIp: clientIpFrom(req),
           userAgent: userAgentFrom(req),
         });
